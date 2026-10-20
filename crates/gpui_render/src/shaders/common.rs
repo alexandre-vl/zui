@@ -145,12 +145,16 @@ mod source {
         pub bounds: Bounds,
         pub fade_out: Edges,
         pub fade_outset: Edges,
+        pub corner_radii: Corners,
+        pub corner_outset: Edges,
     }
 
     impl ContentMask {
         /// The mask's coverage at the given window-space position: 1 inside,
         /// 0 outside, and a linear ramp across each edge's fade distance. Each
-        /// ramp starts `fade_outset` outside its clip edge.
+        /// ramp starts `fade_outset` outside its clip edge. Rounded corners clip
+        /// with an antialiased edge against the rectangle `corner_outset` outside
+        /// the bounds.
         pub fn alpha(content_mask: ContentMask, position: Vec2f) -> f32 {
             let bounds = content_mask.bounds;
             let fade = content_mask.fade_out;
@@ -171,6 +175,22 @@ mod source {
                 alpha *= saturate(
                     (bounds.origin.y + bounds.size.y + outset.bottom - position.y) / fade.bottom,
                 );
+            }
+            if !Corners::is_zero(content_mask.corner_radii) {
+                let corner_outset = content_mask.corner_outset;
+                let rounded = Bounds {
+                    origin: bounds.origin - vec2f(corner_outset.left, corner_outset.top),
+                    size: bounds.size
+                        + vec2f(
+                            corner_outset.left + corner_outset.right,
+                            corner_outset.top + corner_outset.bottom,
+                        ),
+                };
+                alpha *= antialiased_coverage(rounded_rectangle_signed_distance(
+                    position,
+                    rounded,
+                    content_mask.corner_radii,
+                ));
             }
             alpha
         }

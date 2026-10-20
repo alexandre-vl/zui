@@ -114,5 +114,5 @@ pub fn sprite_count(paths: &[Path<ScaledPixels>]) -> usize {
 
 const _: () = {
     assert!(std::mem::size_of::<PathSprite>() == 16);
-    assert!(std::mem::size_of::<PathRasterizationVertex>() == 136);
+    assert!(std::mem::size_of::<PathRasterizationVertex>() == 168);
 };

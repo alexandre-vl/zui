@@ -661,3 +661,71 @@ fn paths_fade_with_their_content_mask() {
     assert_eq!(red_at(149), 255);
     assert_eq!(red_at(151), 0);
 }
+
+#[test]
+fn rounded_content_masks_clip_corners_per_pixel() {
+    let mut renderer = WgpuHeadlessRenderer::new().expect("headless renderer");
+    let pixel_bounds = |x: f32, y: f32, w: f32, h: f32| {
+        gpui::Bounds::new(
+            gpui::point(gpui::px(x), gpui::px(y)),
+            gpui::size(gpui::px(w), gpui::px(h)),
+        )
+    };
+    let card = ContentMask {
+        bounds: pixel_bounds(10.0, 10.0, 100.0, 80.0),
+        corner_radii: Corners::all(gpui::px(20.0)),
+        ..Default::default()
+    };
+    // A nested hard clip over the card's left half, starting 4px below its top edge.
+    let row = ContentMask {
+        bounds: pixel_bounds(0.0, 14.0, 60.0, 90.0),
+        ..Default::default()
+    };
+    let content_mask = row.intersect(&card).scale(1.0);
+    let red: Hsla = gpui::rgb_to_hsla(gpui::rgb(0xff0000));
+
+    let mut scene = Scene::default();
+    scene.insert_primitive(Quad {
+        bounds: bounds(0.0, 0.0, 310.0, 100.0),
+        content_mask,
+        background: solid_background(red),
+        ..Default::default()
+    });
+    // A path under the card's right half is clipped by the same rounded corners.
+    let mut builder = gpui::PathBuilder::fill();
+    builder.move_to(gpui::point(gpui::px(60.0), gpui::px(0.0)));
+    builder.line_to(gpui::point(gpui::px(200.0), gpui::px(0.0)));
+    builder.line_to(gpui::point(gpui::px(200.0), gpui::px(100.0)));
+    builder.line_to(gpui::point(gpui::px(60.0), gpui::px(100.0)));
+    builder.close();
+    let mut path = builder.build().expect("rectangle").scale(1.0);
+    path.content_mask = card.scale(1.0);
+    path.color = solid_background(gpui::white());
+    scene.insert_primitive(path);
+    scene.finish();
+
+    let image = renderer
+        .render_scene_to_image(&scene, TARGET)
+        .expect("render must succeed");
+    let pixel = |x: u32, y: u32| image.get_pixel(x, y).0;
+
+    // The quad: cut by the card's top-left and bottom-left corners, clipped hard by the
+    // row's top edge, and solid elsewhere.
+    assert_eq!(pixel(11, 15)[0], 0, "top-left corner");
+    assert_eq!(pixel(11, 88)[0], 0, "bottom-left corner");
+    assert_eq!(pixel(30, 15)[0], 255, "top edge past the corner");
+    assert_eq!(pixel(30, 12)[0], 0, "row clip");
+    assert_eq!(pixel(11, 50)[0], 255, "straight left edge");
+    assert_eq!(pixel(9, 50)[0], 0, "outside the card");
+    // The path: cut by the card's right corners.
+    assert_eq!(pixel(108, 11)[0], 0, "top-right corner");
+    assert_eq!(pixel(108, 88)[0], 0, "bottom-right corner");
+    assert_eq!(pixel(108, 50), [255, 255, 255, 255], "straight right edge");
+    assert_eq!(pixel(111, 50)[0], 0, "outside the card");
+    // The arc is antialiased.
+    let partial = (10..30)
+        .flat_map(|y| (10..30).map(move |x| (x, y)))
+        .filter(|&(x, y)| (1..255).contains(&pixel(x, y)[0]))
+        .count();
+    assert!(partial >= 10, "only {partial} antialiased arc pixels");
+}

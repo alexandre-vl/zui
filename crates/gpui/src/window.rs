@@ -2176,9 +2176,9 @@ pub struct DispatchEventResult {
 }
 
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
-/// rendered. Currently, only rectangular content masks are supported, but we give the mask its own type
-/// to leave room to support more complex shapes in the future. Edge fades are evaluated in
-/// window space against these axis-aligned bounds and are not transform-aware.
+/// rendered. The mask is an axis-aligned rectangle with optional rounded corners and edge
+/// fades. Corners and fades are evaluated per pixel in window space and are not
+/// transform-aware.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct ContentMask<P: Clone + Debug + Default + PartialEq> {
@@ -2192,6 +2192,15 @@ pub struct ContentMask<P: Clone + Debug + Default + PartialEq> {
     /// the outer ramp instead of losing it. Device-pixel snapping of `bounds` can make a
     /// scaled outset slightly negative, which keeps the ramp at its unsnapped position.
     pub fade_outset: Edges<P>,
+    /// Corner radii of a rounded clip. Content outside the rounded rectangle is clipped
+    /// per pixel with an antialiased edge. All zero leaves the mask rectangular.
+    ///
+    /// Hit testing, backdrop filters and filter layers only use the rectangular `bounds`.
+    pub corner_radii: Corners<P>,
+    /// How far outside `bounds` the edges of the rectangle rounded by `corner_radii` lie.
+    /// Zero rounds `bounds` itself. Intersecting masks sets this when the rounded rectangle
+    /// belongs to an outer mask that extends beyond the intersected bounds.
+    pub corner_outset: Edges<P>,
 }
 
 /// One edge's fade ramp in inward-facing coordinates: opacity rises from 0 at `start` to
@@ -2246,6 +2255,8 @@ impl ContentMask<Pixels> {
             bounds: self.bounds.scale(factor),
             fade_out: self.fade_out.scale(factor),
             fade_outset: self.fade_outset.scale(factor),
+            corner_radii: self.corner_radii.scale(factor),
+            corner_outset: self.corner_outset.scale(factor),
         }
     }
 }
@@ -2259,6 +2270,10 @@ macro_rules! impl_content_mask_intersect {
             /// an outer mask's fade band stays faded when a nested mask clips it. When both
             /// masks fade the same edge, the result is transparent at the clip edge and opaque
             /// only past both ramps; ramps that share a start keep the stronger fade.
+            ///
+            /// A mask holds a single rounded rectangle. Rounded corners that cannot reach
+            /// the intersected bounds are dropped; if both masks still have reachable rounded
+            /// corners, `self`'s are kept and `other` only clips to its rectangle.
             pub fn intersect(&self, other: &Self) -> Self {
                 // Clip edges measured inward, in `Edges` order: top, right, bottom, left.
                 fn clip_edges(bounds: &Bounds<$unit>) -> [f32; 4] {
@@ -2281,7 +2296,68 @@ macro_rules! impl_content_mask_intersect {
                     })
                 }
 
+                // Zeroes every corner whose rounding cannot reach `bounds`: a corner's
+                // rounding stays inside the square its radius spans at that corner.
+                fn reachable_corner_radii(
+                    rounded: &Bounds<$unit>,
+                    radii: &Corners<$unit>,
+                    bounds: &Bounds<$unit>,
+                ) -> Corners<$unit> {
+                    let reachable = |radius: $unit, left: $unit, top: $unit| {
+                        if radius > $unit(0.)
+                            && Bounds::new(point(left, top), size(radius, radius))
+                                .intersects(bounds)
+                        {
+                            radius
+                        } else {
+                            $unit(0.)
+                        }
+                    };
+                    let (left, top) = (rounded.left(), rounded.top());
+                    let (right, bottom) = (rounded.right(), rounded.bottom());
+                    Corners {
+                        top_left: reachable(radii.top_left, left, top),
+                        top_right: reachable(radii.top_right, right - radii.top_right, top),
+                        bottom_right: reachable(
+                            radii.bottom_right,
+                            right - radii.bottom_right,
+                            bottom - radii.bottom_right,
+                        ),
+                        bottom_left: reachable(radii.bottom_left, left, bottom - radii.bottom_left),
+                    }
+                }
+                fn rounded_bounds(mask: &ContentMask<$unit>) -> Bounds<$unit> {
+                    let outset = &mask.corner_outset;
+                    Bounds::from_corners(
+                        point(
+                            mask.bounds.left() - outset.left,
+                            mask.bounds.top() - outset.top,
+                        ),
+                        point(
+                            mask.bounds.right() + outset.right,
+                            mask.bounds.bottom() + outset.bottom,
+                        ),
+                    )
+                }
+
                 let bounds = self.bounds.intersect(&other.bounds);
+                let (corner_radii, corner_outset) = [self, other]
+                    .into_iter()
+                    .find_map(|mask| {
+                        let rounded = rounded_bounds(mask);
+                        let radii = reachable_corner_radii(&rounded, &mask.corner_radii, &bounds);
+                        (radii != Corners::default()).then(|| {
+                            let outset = Edges {
+                                top: bounds.top() - rounded.top(),
+                                right: rounded.right() - bounds.right(),
+                                bottom: rounded.bottom() - bounds.bottom(),
+                                left: bounds.left() - rounded.left(),
+                            };
+                            (radii, outset)
+                        })
+                    })
+                    .unwrap_or_default();
+
                 let clips = clip_edges(&bounds);
                 let (self_ramps, other_ramps) = (ramps(self), ramps(other));
                 let [top, right, bottom, left] = std::array::from_fn(|edge| {
@@ -2304,6 +2380,8 @@ macro_rules! impl_content_mask_intersect {
                         bottom: $unit(bottom.1),
                         left: $unit(left.1),
                     },
+                    corner_radii,
+                    corner_outset,
                 }
             }
         }
@@ -2383,6 +2461,60 @@ mod content_mask_tests {
         let intersection = outer.intersect(&inner);
         assert_eq!(intersection.fade_out.left, px(10.));
         assert_eq!(intersection.fade_outset.left, px(0.));
+    }
+
+    fn rounded(left: f32, top: f32, width: f32, height: f32, radius: f32) -> ContentMask<Pixels> {
+        ContentMask {
+            bounds: Bounds::new(point(px(left), px(top)), size(px(width), px(height))),
+            corner_radii: Corners::all(px(radius)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn nested_clip_keeps_reachable_rounded_corners() {
+        let card = rounded(0., 0., 100., 100., 10.);
+        // A full-width row 5px from the card's top still meets both top corners.
+        let row = rounded(0., 5., 100., 20., 0.);
+        for intersection in [row.intersect(&card), card.intersect(&row)] {
+            assert_eq!(
+                intersection.corner_radii,
+                Corners {
+                    top_left: px(10.),
+                    top_right: px(10.),
+                    ..Default::default()
+                }
+            );
+            assert_eq!(
+                intersection.corner_outset,
+                Edges {
+                    top: px(5.),
+                    bottom: px(75.),
+                    ..Default::default()
+                }
+            );
+        }
+
+        // A row away from the corners drops the rounding entirely.
+        let middle_row = rounded(0., 40., 100., 20., 0.);
+        let intersection = middle_row.intersect(&card);
+        assert_eq!(intersection.corner_radii, Corners::default());
+        assert_eq!(intersection.corner_outset, Edges::default());
+    }
+
+    #[test]
+    fn inner_rounded_mask_wins_when_both_reach() {
+        let card = rounded(0., 0., 100., 100., 10.);
+        let avatar = rounded(0., 0., 40., 40., 20.);
+        let intersection = avatar.intersect(&card);
+        assert_eq!(intersection.bounds, avatar.bounds);
+        assert_eq!(intersection.corner_radii, Corners::all(px(20.)));
+        assert_eq!(intersection.corner_outset, Edges::default());
+
+        // The outer rounding is used when the inner mask's corners are out of reach.
+        let wide = rounded(-50., -50., 200., 200., 20.);
+        let intersection = wide.intersect(&card);
+        assert_eq!(intersection.corner_radii, Corners::all(px(10.)));
     }
 
     #[test]
@@ -3310,6 +3442,41 @@ impl Window {
                     -1.,
                 ),
             },
+            ..self.snapped_corners(&mask, bounds)
+        }
+    }
+
+    /// The rounded corners of `mask`, relative to its snapped `bounds`. The rounded
+    /// rectangle snaps like painted quads do, so a rounded clip matching an element's
+    /// background follows the same contour.
+    fn snapped_corners(
+        &self,
+        mask: &ContentMask<Pixels>,
+        bounds: Bounds<ScaledPixels>,
+    ) -> ContentMask<ScaledPixels> {
+        if mask.corner_radii == Corners::default() {
+            return ContentMask::default();
+        }
+        let outset = &mask.corner_outset;
+        let rounded = self.snap_bounds(Bounds::from_corners(
+            point(
+                mask.bounds.left() - outset.left,
+                mask.bounds.top() - outset.top,
+            ),
+            point(
+                mask.bounds.right() + outset.right,
+                mask.bounds.bottom() + outset.bottom,
+            ),
+        ));
+        ContentMask {
+            corner_radii: mask.corner_radii.scale(self.scale_factor()),
+            corner_outset: Edges {
+                top: bounds.top() - rounded.top(),
+                right: rounded.right() - bounds.right(),
+                bottom: rounded.bottom() - bounds.bottom(),
+                left: bounds.left() - rounded.left(),
+            },
+            ..ContentMask::default()
         }
     }
 
@@ -4261,6 +4428,33 @@ impl Window {
         } else {
             f(self)
         }
+    }
+
+    /// Invoke the given function with painting clipped to `bounds` with rounded corners,
+    /// intersected with the current content mask. This method should only be called during
+    /// element drawing.
+    ///
+    /// Every primitive that applies the content mask per pixel (quads, shadows, text,
+    /// underlines, images, SVGs, paths and surfaces) is clipped to the rounded rectangle
+    /// with an antialiased edge, so content scrolling inside a rounded container never
+    /// shows past its corners. Hit testing, backdrop filters and filter layers only clip to
+    /// the rectangular bounds. A content mask holds one rounded rectangle: when this clip
+    /// and an enclosing rounded clip both reach the painted region, this one is kept and
+    /// the enclosing one clips to its rectangle only.
+    pub fn with_rounded_clip<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: impl Into<Corners<Pixels>>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.with_content_mask(
+            Some(ContentMask {
+                bounds,
+                corner_radii: corner_radii.into(),
+                ..Default::default()
+            }),
+            f,
+        )
     }
 
     /// Updates the global element offset relative to the current offset. This is used to implement
@@ -8966,6 +9160,65 @@ mod tests {
                 assert_eq!(
                     top_strip.content_mask.fade_out.left,
                     ScaledPixels(20. * scale)
+                );
+            })
+            .unwrap();
+    }
+
+    struct RoundedClipView;
+
+    impl Render for RoundedClipView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            canvas(
+                |_, _, _| {},
+                |_, _, window, _| {
+                    let card = Bounds::new(point(px(10.3), px(10.)), size(px(100.), px(80.)));
+                    window.with_rounded_clip(card, px(12.), |window| {
+                        // A hard clip in the card's top-left corner keeps that corner.
+                        let row = Bounds::new(point(px(0.), px(14.)), size(px(60.), px(20.)));
+                        window.with_content_mask(
+                            Some(ContentMask {
+                                bounds: row,
+                                ..Default::default()
+                            }),
+                            |window| {
+                                window.paint_quad(PaintQuad::new(row).background(crate::white()))
+                            },
+                        );
+                    });
+                },
+            )
+            .size_full()
+        }
+    }
+
+    #[gpui::test]
+    fn rounded_clips_reach_painted_primitives(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| RoundedClipView);
+        window
+            .update(cx, |_, window, _| {
+                let scale = window.scale_factor();
+                let quads = &window.rendered_frame.scene.quads;
+                assert_eq!(quads.len(), 1);
+                let mask = quads[0].content_mask;
+                assert_eq!(
+                    mask.corner_radii,
+                    Corners {
+                        top_left: ScaledPixels(12. * scale),
+                        ..Default::default()
+                    }
+                );
+                // The rounded rectangle is the card, snapped like a painted quad.
+                let card = window.snap_bounds(Bounds::new(
+                    point(px(10.3), px(10.)),
+                    size(px(100.), px(80.)),
+                ));
+                assert_eq!(mask.bounds.left() - mask.corner_outset.left, card.left());
+                assert_eq!(mask.bounds.top() - mask.corner_outset.top, card.top());
+                assert_eq!(mask.bounds.right() + mask.corner_outset.right, card.right());
+                assert_eq!(
+                    mask.bounds.bottom() + mask.corner_outset.bottom,
+                    card.bottom()
                 );
             })
             .unwrap();
