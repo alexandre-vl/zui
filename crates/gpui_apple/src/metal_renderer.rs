@@ -659,6 +659,15 @@ impl MetalRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
+        // `nextDrawable` and command encoders are autoreleased. Frames are driven by
+        // display-link callbacks on the main queue, and several of them (one per
+        // window) can run before the run loop drains its pool, so scope each frame to
+        // its own pool to hand drawables back to the layer promptly. In-flight command
+        // buffers retain the resources they reference.
+        objc2::rc::autoreleasepool(|_| self.draw_frame(scene));
+    }
+
+    fn draw_frame(&mut self, scene: &Scene) {
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
