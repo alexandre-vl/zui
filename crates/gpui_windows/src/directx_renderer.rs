@@ -14,7 +14,7 @@ use gpui_render::{
         visible_composite_region,
     },
     filter_targets::{FilterTargetRetention, FilterTargets},
-    path_types::{PathRasterizationVertex, PathSprite},
+    path_types::{self, PathRasterizationVertex, PathSprite},
     shaders::{
         common::{FontRasterizationUniforms, GlobalUniforms, ShaderBool, SurfaceColorFormat},
         interface as shader_interface,
@@ -1175,12 +1175,13 @@ impl DirectXRenderer {
         self.path_rasterization_vertices
             .reserve(rasterization_vertex_count);
         for path in paths {
+            let content_mask = path_types::rasterization_content_mask(path);
             self.path_rasterization_vertices
                 .extend(path.vertices.iter().map(|vertex| PathRasterizationVertex {
                     xy_position: vertex.xy_position,
                     curve_position: vertex.st_position,
                     color: path.color,
-                    bounds: path.clipped_bounds(),
+                    content_mask,
                 }));
         }
         debug_assert_eq!(

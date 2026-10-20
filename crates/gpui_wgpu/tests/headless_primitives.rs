@@ -623,3 +623,41 @@ fn nested_clip_keeps_the_outer_edge_fade() {
     assert_eq!(red_at(30), 255);
     assert_eq!(red_at(60), 0);
 }
+
+#[test]
+fn paths_fade_with_their_content_mask() {
+    let mut renderer = WgpuHeadlessRenderer::new().expect("headless renderer");
+    let mut builder = gpui::PathBuilder::fill();
+    builder.move_to(gpui::point(gpui::px(0.0), gpui::px(0.0)));
+    builder.line_to(gpui::point(gpui::px(200.0), gpui::px(0.0)));
+    builder.line_to(gpui::point(gpui::px(200.0), gpui::px(100.0)));
+    builder.line_to(gpui::point(gpui::px(0.0), gpui::px(100.0)));
+    builder.close();
+    let mut path = builder.build().expect("rectangle").scale(1.0);
+    // The path starts 10px into the mask's 20px left fade.
+    path.content_mask = ContentMask {
+        bounds: bounds(-10.0, 0.0, 160.0, 100.0),
+        fade_out: Edges {
+            left: ScaledPixels(20.0),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    path.color = solid_background(gpui::white());
+
+    let mut scene = Scene::default();
+    scene.insert_primitive(path);
+    scene.finish();
+    let image = renderer
+        .render_scene_to_image(&scene, TARGET)
+        .expect("render must succeed");
+    let red_at = |x: u32| image.get_pixel(x, 50).0[0];
+
+    // 10.5px of the 20px ramp lies left of pixel 0's center: 52.5% coverage.
+    assert!(red_at(0).abs_diff(134) <= 3, "got {}", red_at(0));
+    assert!(red_at(5).abs_diff(198) <= 3, "got {}", red_at(5));
+    assert_eq!(red_at(40), 255);
+    // The mask's unfaded right edge still clips hard.
+    assert_eq!(red_at(149), 255);
+    assert_eq!(red_at(151), 0);
+}

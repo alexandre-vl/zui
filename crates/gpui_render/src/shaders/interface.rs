@@ -239,6 +239,6 @@ pub const RENDER_BUFFER_LAYOUTS: &[gpui::SceneBufferLayout] = &[
         xy_position,
         curve_position,
         color,
-        bounds
+        content_mask
     ),
 ];
