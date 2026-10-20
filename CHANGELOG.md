@@ -17,6 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Changelog established
 - Default text layout system switched to [parley](https://github.com/linebender/parley) [#267](https://github.com/gpui-ce/gpui-ce/pull/267)
 - `PaintQuad::new` and property-building functions [#338](https://github.com/gpui-ce/gpui-ce/pull/338)
+- `Window::on_present`, for applying state outside the scene (such as native view geometry) when the painted frame is presented
 
 ### Removals
 

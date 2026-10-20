@@ -1138,6 +1138,7 @@ pub(crate) struct Frame {
     pointer_observers: Rc<Vec<PointerObserver>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
+    presentation_callbacks: Vec<Rc<dyn Fn()>>,
     pub(crate) hitboxes: Vec<Hitbox>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
@@ -1166,6 +1167,7 @@ pub(crate) struct PrepaintStateIndex {
 #[derive(Clone, Default)]
 pub(crate) struct PaintIndex {
     scene_index: usize,
+    presentation_callbacks_index: usize,
     mouse_listeners_index: usize,
     pointer_observers_index: usize,
     input_handlers_index: usize,
@@ -1186,6 +1188,7 @@ impl Frame {
             pointer_observers: Rc::default(),
             dispatch_tree,
             scene: Scene::default(),
+            presentation_callbacks: Vec::new(),
             hitboxes: Vec::new(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
@@ -1212,6 +1215,7 @@ impl Frame {
         Rc::make_mut(&mut self.pointer_observers).clear();
         self.dispatch_tree.clear();
         self.scene.clear();
+        self.presentation_callbacks.clear();
         self.input_handlers.clear();
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
@@ -3397,12 +3401,38 @@ impl Window {
         self.invalidator.replace_views(views);
     }
 
+    /// Registers a callback that runs when the frame being painted is presented,
+    /// immediately before its scene is handed to the platform for drawing.
+    ///
+    /// Use this to keep state outside of GPUI's scene — such as the frame of a
+    /// native child view positioned by an element — in step with the pixels on
+    /// screen. Painting alone is not a reliable signal: a frame can be painted
+    /// and then superseded before it is ever shown, and cached views reuse
+    /// their previous paint without running it again. Callbacks registered here
+    /// are dropped with a superseded frame and carried over when a view's
+    /// paint is reused, exactly like its drawing primitives.
+    ///
+    /// The same frame can be presented more than once (for example, to keep
+    /// the display clocked up during rapid input), so callbacks should apply
+    /// state idempotently rather than accumulate it.
+    ///
+    /// This method should only be called during the paint phase of element drawing.
+    pub fn on_present(&mut self, callback: impl Fn() + 'static) {
+        self.invalidator.debug_assert_paint();
+        self.next_frame
+            .presentation_callbacks
+            .push(Rc::new(callback));
+    }
+
     #[profiling::function]
     fn present(&mut self) {
         #[cfg(feature = "profiler")]
         let _foreground_turn = profiler::journal::foreground_turn();
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
+        for callback in &self.rendered_frame.presentation_callbacks {
+            callback();
+        }
         self.platform_window.draw(&self.rendered_frame.scene);
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
@@ -3850,6 +3880,7 @@ impl Window {
     pub(crate) fn paint_index(&self) -> PaintIndex {
         PaintIndex {
             scene_index: self.next_frame.scene.len(),
+            presentation_callbacks_index: self.next_frame.presentation_callbacks.len(),
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
             pointer_observers_index: self.next_frame.pointer_observers.len(),
             input_handlers_index: self.next_frame.input_handlers.len(),
@@ -3861,6 +3892,12 @@ impl Window {
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
+        self.next_frame.presentation_callbacks.extend(
+            self.rendered_frame.presentation_callbacks
+                [range.start.presentation_callbacks_index..range.end.presentation_callbacks_index]
+                .iter()
+                .cloned(),
+        );
         Rc::make_mut(&mut self.next_frame.pointer_observers).extend(
             self.rendered_frame.pointer_observers
                 [range.start.pointer_observers_index..range.end.pointer_observers_index]
@@ -9738,5 +9775,115 @@ mod tests {
             assert_eq!(renders.get(), initial_renders);
             assert_eq!(paints.get(), initial_paints);
         }
+    }
+
+    struct PresentProbe {
+        desired: Rc<Cell<u32>>,
+        displayed: Rc<Cell<u32>>,
+        calls: Rc<Cell<u32>>,
+        paints: Rc<Cell<u32>>,
+    }
+
+    impl Render for PresentProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let desired = self.desired.get();
+            let displayed = self.displayed.clone();
+            let calls = self.calls.clone();
+            let paints = self.paints.clone();
+            canvas(
+                |_, _, _| (),
+                move |_, _, window, _| {
+                    paints.set(paints.get() + 1);
+                    window.on_present(move || {
+                        displayed.set(desired);
+                        calls.set(calls.get() + 1);
+                    });
+                },
+            )
+            .size_full()
+        }
+    }
+
+    #[test]
+    fn native_updates_wait_for_the_presented_frame() {
+        let mut cx = TestAppContext::single();
+        let desired = Rc::new(Cell::new(1));
+        let displayed = Rc::new(Cell::new(0));
+        let calls = Rc::new(Cell::new(0));
+        let handle = cx.add_window(|_, _| PresentProbe {
+            desired: desired.clone(),
+            displayed: displayed.clone(),
+            calls: calls.clone(),
+            paints: Rc::default(),
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert_eq!(
+                displayed.get(),
+                0,
+                "painting a frame must not apply its presentation callbacks"
+            );
+            desired.set(2);
+            window.refresh();
+            window.draw(cx).clear(cx);
+            assert_eq!(displayed.get(), 0);
+            window.present();
+            assert_eq!(
+                displayed.get(),
+                2,
+                "presentation must apply the latest painted frame"
+            );
+            assert_eq!(
+                calls.get(),
+                1,
+                "callbacks from a superseded frame must be discarded"
+            );
+        })
+        .unwrap();
+    }
+
+    struct CachedPresentParent {
+        child: Entity<PresentProbe>,
+    }
+
+    impl Render for CachedPresentParent {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size(px(40.)).child(
+                self.child
+                    .clone()
+                    .cached(crate::StyleRefinement::default().size(px(20.))),
+            )
+        }
+    }
+
+    #[test]
+    fn presentation_callbacks_follow_cached_paint_reuse() {
+        let desired = Rc::new(Cell::new(1));
+        let displayed = Rc::new(Cell::new(0));
+        let calls = Rc::new(Cell::new(0));
+        let paints = Rc::new(Cell::new(0));
+        let mut app = TestApp::new();
+        let mut test_window = app.open_window(|_, cx| CachedPresentParent {
+            child: cx.new(|_| PresentProbe {
+                desired: desired.clone(),
+                displayed: displayed.clone(),
+                calls: calls.clone(),
+                paints: paints.clone(),
+            }),
+        });
+        test_window.draw();
+        test_window.update(|_, window, _| window.present());
+        assert_eq!((displayed.get(), calls.get()), (1, 1));
+
+        // Redraw only the parent; the cached child replays its previous paint.
+        test_window.update(|_, _, cx| cx.notify());
+        test_window.draw();
+        assert_eq!(paints.get(), 1, "the child's paint should have been reused");
+        test_window.update(|_, window, _| window.present());
+        assert_eq!(
+            (displayed.get(), calls.get()),
+            (1, 2),
+            "a reused paint must keep its presentation callbacks"
+        );
     }
 }
