@@ -173,16 +173,28 @@ pub fn new_renderer(
     Ok(MetalRenderer::new(context, transparent))
 }
 
+/// Size of each pooled instance buffer until a frame needs more.
+const DEFAULT_INSTANCE_BUFFER_SIZE: usize = 2 * 1024 * 1024;
+/// Consecutive frames that must fit in half the pooled buffer size before the pool
+/// shrinks its buffers.
+const INSTANCE_BUFFER_SHRINK_AFTER_FRAMES: u32 = 120;
+
 pub struct InstanceBufferPool {
     buffer_size: usize,
     buffers: Vec<metal::Buffer>,
+    /// Consecutive frames that needed at most half of `buffer_size`.
+    frames_below_half: u32,
+    /// Largest size needed by any of those frames.
+    peak_below_half: usize,
 }
 
 impl Default for InstanceBufferPool {
     fn default() -> Self {
         Self {
-            buffer_size: 2 * 1024 * 1024,
+            buffer_size: DEFAULT_INSTANCE_BUFFER_SIZE,
             buffers: Vec::new(),
+            frames_below_half: 0,
+            peak_below_half: 0,
         }
     }
 }
@@ -196,6 +208,38 @@ impl InstanceBufferPool {
     pub(crate) fn reset(&mut self, buffer_size: usize) {
         self.buffer_size = buffer_size;
         self.buffers.clear();
+        self.frames_below_half = 0;
+        self.peak_below_half = 0;
+    }
+
+    /// Sizes the pooled buffers for a frame that needs `minimum_size` bytes. Buffers
+    /// grow to fit a larger frame right away, and shrink back once a run of frames
+    /// fit in half their size, so one complex frame doesn't pin its buffer size for
+    /// the life of the process. Buffers of the old size still in flight are dropped
+    /// when they are released.
+    fn fit_buffer_size(&mut self, minimum_size: usize) {
+        if minimum_size > self.buffer_size {
+            self.reset(
+                minimum_size
+                    .checked_next_power_of_two()
+                    .unwrap_or(minimum_size),
+            );
+        } else if self.buffer_size > DEFAULT_INSTANCE_BUFFER_SIZE
+            && minimum_size <= self.buffer_size / 2
+        {
+            self.peak_below_half = self.peak_below_half.max(minimum_size);
+            self.frames_below_half += 1;
+            if self.frames_below_half >= INSTANCE_BUFFER_SHRINK_AFTER_FRAMES {
+                let buffer_size = self
+                    .peak_below_half
+                    .next_power_of_two()
+                    .max(DEFAULT_INSTANCE_BUFFER_SIZE);
+                self.reset(buffer_size);
+            }
+        } else {
+            self.frames_below_half = 0;
+            self.peak_below_half = 0;
+        }
     }
 
     pub(crate) fn acquire(
@@ -204,13 +248,7 @@ impl InstanceBufferPool {
         unified_memory: bool,
         minimum_size: usize,
     ) -> InstanceBuffer {
-        if minimum_size > self.buffer_size {
-            self.reset(
-                minimum_size
-                    .checked_next_power_of_two()
-                    .unwrap_or(minimum_size),
-            );
-        }
+        self.fit_buffer_size(minimum_size);
         let buffer = self.buffers.pop().unwrap_or_else(|| {
             let options = if unified_memory {
                 MTLResourceOptions::StorageModeShared
@@ -2389,6 +2427,41 @@ mod tests {
         assert!(renderer.scene_color_texture.is_none());
         assert!(renderer.blur_ping_texture.is_none());
         assert!(renderer.blur_pong_texture.is_none());
+    }
+
+    #[test]
+    fn instance_buffer_pool_shrinks_after_a_run_of_smaller_frames() {
+        const MIB: usize = 1024 * 1024;
+        let mut pool = InstanceBufferPool::default();
+        pool.fit_buffer_size(MIB);
+        assert_eq!(pool.buffer_size, DEFAULT_INSTANCE_BUFFER_SIZE);
+
+        pool.fit_buffer_size(20 * MIB);
+        assert_eq!(pool.buffer_size, 32 * MIB, "grows to fit a large frame");
+
+        // A frame needing more than half the buffer size restarts the run.
+        for _ in 1..INSTANCE_BUFFER_SHRINK_AFTER_FRAMES {
+            pool.fit_buffer_size(MIB);
+        }
+        pool.fit_buffer_size(17 * MIB);
+        for _ in 1..INSTANCE_BUFFER_SHRINK_AFTER_FRAMES {
+            pool.fit_buffer_size(MIB);
+        }
+        assert_eq!(pool.buffer_size, 32 * MIB);
+
+        // Shrinks to fit the largest frame of the run.
+        pool.fit_buffer_size(5 * MIB);
+        assert_eq!(pool.buffer_size, 8 * MIB);
+        for _ in 0..INSTANCE_BUFFER_SHRINK_AFTER_FRAMES {
+            pool.fit_buffer_size(MIB);
+        }
+        assert_eq!(pool.buffer_size, DEFAULT_INSTANCE_BUFFER_SIZE);
+
+        // Never below the default size.
+        for _ in 0..INSTANCE_BUFFER_SHRINK_AFTER_FRAMES {
+            pool.fit_buffer_size(0);
+        }
+        assert_eq!(pool.buffer_size, DEFAULT_INSTANCE_BUFFER_SIZE);
     }
 
     #[test]
