@@ -379,8 +379,34 @@ pub struct MetalRenderer {
 impl MetalRenderer {
     /// Creates a new MetalRenderer with a CAMetalLayer for window-based rendering.
     pub fn new(instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>, transparent: bool) -> Self {
-        let device = Self::create_device();
+        Self::new_for_window(
+            Self::create_device(),
+            instance_buffer_pool,
+            transparent,
+            None,
+        )
+    }
 
+    /// Creates a transparent renderer for a second layer in the same window, such as a plane
+    /// composited above native child views.
+    ///
+    /// The new renderer shares this renderer's device, instance buffers and sprite atlas, so
+    /// both can draw scenes produced against the window's single [`gpui::PlatformAtlas`].
+    pub fn new_overlay(&self) -> Self {
+        Self::new_for_window(
+            self.device.clone(),
+            self.instance_buffer_pool.clone(),
+            true,
+            Some(self.sprite_atlas.clone()),
+        )
+    }
+
+    fn new_for_window(
+        device: metal::Device,
+        instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
+        transparent: bool,
+        sprite_atlas: Option<Arc<MetalAtlas>>,
+    ) -> Self {
         let layer = new_window_layer(transparent);
         layer.set_device(&device);
         layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
@@ -389,7 +415,13 @@ impl MetalRenderer {
         #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
         layer.set_framebuffer_only(false);
 
-        Self::new_internal(device, Some(layer), !transparent, instance_buffer_pool)
+        Self::new_internal(
+            device,
+            Some(layer),
+            !transparent,
+            instance_buffer_pool,
+            sprite_atlas,
+        )
     }
 
     /// Creates a new headless MetalRenderer for offscreen rendering without a window.
@@ -399,7 +431,7 @@ impl MetalRenderer {
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
     pub fn new_headless(instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>) -> Self {
         let device = Self::create_device();
-        Self::new_internal(device, None, true, instance_buffer_pool)
+        Self::new_internal(device, None, true, instance_buffer_pool, None)
     }
 
     fn create_device() -> metal::Device {
@@ -429,6 +461,7 @@ impl MetalRenderer {
         layer: Option<metal::MetalLayer>,
         opaque: bool,
         instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
+        sprite_atlas: Option<Arc<MetalAtlas>>,
     ) -> Self {
         // Shared memory can be used only if CPU and GPU share the same memory space.
         // https://developer.apple.com/documentation/metal/setting-resource-storage-modes
@@ -579,7 +612,8 @@ impl MetalRenderer {
         let sampler = device.new_sampler(&sampler_descriptor);
 
         let command_queue = device.new_command_queue();
-        let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
+        let sprite_atlas =
+            sprite_atlas.unwrap_or_else(|| Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu)));
         let core_video_texture_cache =
             CVMetalTextureCache::new(None, device.clone(), None).unwrap();
 
@@ -2495,6 +2529,46 @@ mod tests {
             assert_eq!(usage.note_frame(0, 1), 1);
         }
         assert_eq!(usage.note_frame(0, 1), 0);
+    }
+
+    #[test]
+    fn overlay_renderers_share_resources_and_clear_transparent() {
+        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
+        let base = MetalRenderer::new(pool, false);
+        let mut overlay = base.new_overlay();
+        assert!(Arc::ptr_eq(base.sprite_atlas(), overlay.sprite_atlas()));
+        assert!(Arc::ptr_eq(
+            &base.instance_buffer_pool,
+            &overlay.instance_buffer_pool
+        ));
+        assert_eq!(base.device.registry_id(), overlay.device.registry_id());
+        assert!(base.layer().unwrap().is_opaque());
+        assert!(!overlay.layer().unwrap().is_opaque());
+
+        overlay.update_drawable_size(size(DevicePixels(4), DevicePixels(4)));
+        let bounds = Bounds {
+            origin: gpui::point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size: size(ScaledPixels(2.0), ScaledPixels(2.0)),
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            bounds,
+            content_mask: ContentMask {
+                bounds,
+                ..Default::default()
+            },
+            background: solid_background(white()),
+            ..Default::default()
+        });
+        scene.finish();
+
+        let image = overlay.render_to_image(&scene).unwrap();
+        assert_eq!(pixel(&image, 0, 0), [255, 255, 255, 255]);
+        assert_eq!(
+            pixel(&image, 3, 3)[3],
+            0,
+            "an overlay must not cover native content outside its primitives"
+        );
     }
 
     #[test]

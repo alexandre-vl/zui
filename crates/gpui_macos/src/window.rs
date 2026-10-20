@@ -65,6 +65,8 @@ use std::{
 };
 
 const WINDOW_STATE_IVAR: &str = "windowState";
+/// Holds an `Arc<AtomicBool>` on each `GPUIOverlayView`, set while overlay content is interactive.
+const OVERLAY_CAPTURES_INPUT_IVAR: &str = "capturesInput";
 
 unsafe fn set_window_state_ivar(object: ObjcId, state: *mut c_void) {
     let object = unsafe { &mut *object };
@@ -287,6 +289,8 @@ static mut WINDOW_CLASS: *const AnyClass = ptr::null();
 static mut PANEL_CLASS: *const AnyClass = ptr::null();
 static mut VIEW_CLASS: *const AnyClass = ptr::null();
 static mut BLURRED_VIEW_CLASS: *const AnyClass = ptr::null();
+static mut OVERLAY_VIEW_CLASS: *const AnyClass = ptr::null();
+static mut NATIVE_HOST_VIEW_CLASS: *const AnyClass = ptr::null();
 
 #[allow(non_upper_case_globals)]
 const VIEW_WIDTH_SIZABLE: NSUInteger = 1 << 1;
@@ -521,6 +525,79 @@ unsafe fn build_classes() {
                 sel!(updateLayer),
                 blurred_view_update_layer as unsafe extern "C" fn(_, _),
             );
+            decl.register() as *const AnyClass
+        };
+        // The scene overlay's transparent plane, the topmost subview of `GPUIView`. It never
+        // becomes first responder: pointer events it accepts are handled as if `GPUIView`
+        // received them, and keyboard input stays with `GPUIView`. This event registration is
+        // adapted from the Apache-2.0 GPUI fork at https://github.com/egoist/zed (57bd4fe).
+        OVERLAY_VIEW_CLASS = {
+            let mut decl = ClassBuilder::new(
+                CString::new("GPUIOverlayView").unwrap().as_c_str(),
+                class!(NSView),
+            )
+            .unwrap();
+            decl.add_ivar::<*mut c_void>(CString::new(WINDOW_STATE_IVAR).unwrap().as_c_str());
+            decl.add_ivar::<*const c_void>(
+                CString::new(OVERLAY_CAPTURES_INPUT_IVAR)
+                    .unwrap()
+                    .as_c_str(),
+            );
+            decl.add_method(
+                sel!(dealloc),
+                dealloc_overlay_view as unsafe extern "C" fn(_, _),
+            );
+            decl.add_method(
+                sel!(hitTest:),
+                overlay_view_hit_test as unsafe extern "C" fn(_, _, _) -> _,
+            );
+            decl.add_method(
+                sel!(acceptsFirstMouse:),
+                accepts_first_mouse as unsafe extern "C" fn(_, _, _) -> _,
+            );
+            decl.add_method(
+                sel!(_opaqueRectForWindowMoveWhenInTitlebar),
+                opaque_rect_for_window_move_when_in_titlebar
+                    as unsafe extern "C" fn(_, _) -> Objc2NSRect,
+            );
+            for selector in [
+                sel!(mouseDown:),
+                sel!(mouseUp:),
+                sel!(rightMouseDown:),
+                sel!(rightMouseUp:),
+                sel!(otherMouseDown:),
+                sel!(otherMouseUp:),
+                sel!(mouseMoved:),
+                sel!(mouseExited:),
+                sel!(mouseDragged:),
+                sel!(rightMouseDragged:),
+                sel!(otherMouseDragged:),
+                sel!(scrollWheel:),
+                sel!(magnifyWithEvent:),
+                sel!(swipeWithEvent:),
+                sel!(pressureChangeWithEvent:),
+            ] {
+                decl.add_method(
+                    selector,
+                    overlay_view_event as unsafe extern "C" fn(_, _, _),
+                );
+            }
+            decl.register() as *const AnyClass
+        };
+        // Hosts application-owned native child views between GPUI's two planes. It is
+        // transparent to the pointer except over its children, and flipped so children are
+        // positioned in the same top-left-origin coordinates as GPUI elements.
+        NATIVE_HOST_VIEW_CLASS = {
+            let mut decl = ClassBuilder::new(
+                CString::new("GPUINativeContentView").unwrap().as_c_str(),
+                class!(NSView),
+            )
+            .unwrap();
+            decl.add_method(
+                sel!(hitTest:),
+                native_host_view_hit_test as unsafe extern "C" fn(_, _, _) -> _,
+            );
+            decl.add_method(sel!(isFlipped), yes as unsafe extern "C" fn(_, _) -> _);
             decl.register() as *const AnyClass
         };
     }
@@ -824,6 +901,9 @@ struct MacWindowState {
     /// Shared with the frame waker, which must not lock this state.
     frame_requests_active: Arc<AtomicBool>,
     renderer: renderer::Renderer,
+    /// The plane above native child views, once `enable_scene_overlay` has succeeded.
+    #[cfg(not(feature = "wgpu"))]
+    scene_overlay: Option<SceneOverlay>,
     /// Forces an uncached scene after GPU recovery or a transient presentation failure.
     force_render_pending: bool,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
@@ -866,7 +946,76 @@ struct MacWindowState {
     sheet_parent: Option<ObjcId>,
 }
 
+/// A transparent Metal plane above native child views, drawing the part of each scene painted
+/// after the root view. Native children live in `native_host`, between `GPUIView`'s own layer
+/// (the base plane) and `view`:
+///
+/// ```text
+/// GPUIView (base plane)
+/// ├── GPUINativeContentView (application-owned native children)
+/// └── GPUIOverlayView (overlay plane)
+/// ```
+#[cfg(not(feature = "wgpu"))]
+struct SceneOverlay {
+    renderer: renderer::Renderer,
+    /// The `GPUIOverlayView` backed by `renderer`'s layer. Owned by its superview.
+    view: NonNull<Objc2Object>,
+    /// The `GPUINativeContentView` handed to applications. Owned by its superview.
+    native_host: NonNull<Objc2Object>,
+    /// Shared with `view`'s hit testing.
+    captures_input: Arc<AtomicBool>,
+    visible: bool,
+    drawable_size: Size<gpui::DevicePixels>,
+    scale_factor: f32,
+}
+
+#[cfg(not(feature = "wgpu"))]
+impl SceneOverlay {
+    fn update_drawable_size(&mut self, drawable_size: Size<gpui::DevicePixels>, scale_factor: f32) {
+        if self.drawable_size == drawable_size && self.scale_factor == scale_factor {
+            return;
+        }
+        self.renderer.update_drawable_size(drawable_size);
+        if let Some(layer) = self.renderer.layer() {
+            unsafe {
+                let _: () = msg_send![
+                    layer.as_ptr() as ObjcId,
+                    setContentsScale: scale_factor as f64
+                ];
+            }
+        }
+        self.drawable_size = drawable_size;
+        self.scale_factor = scale_factor;
+    }
+
+    fn set_visible(&mut self, visible: bool) {
+        if self.visible != visible {
+            unsafe {
+                let _: () = msg_send![self.view.as_ptr(), setHidden: Bool::new(!visible)];
+            }
+            self.visible = visible;
+        }
+    }
+}
+
 impl MacWindowState {
+    /// Synchronous presentation commits a drawable in the same Core Animation transaction as
+    /// AppKit's own changes. It is used while resizing, and permanently once a scene overlay
+    /// exists: native child geometry (applied by presentation callbacks) and both Metal planes
+    /// must then land on screen in the same frame.
+    fn set_presents_with_transaction(&mut self, presents_with_transaction: bool) {
+        #[cfg(not(feature = "wgpu"))]
+        let presents_with_transaction = presents_with_transaction || self.scene_overlay.is_some();
+        self.renderer
+            .set_presents_with_transaction(presents_with_transaction);
+        #[cfg(not(feature = "wgpu"))]
+        if let Some(overlay) = self.scene_overlay.as_mut() {
+            overlay
+                .renderer
+                .set_presents_with_transaction(presents_with_transaction);
+        }
+    }
+
     fn next_frame_request(&mut self) -> RequestFrameOptions {
         RequestFrameOptions {
             force_render: mem::take(&mut self.force_render_pending),
@@ -1282,6 +1431,8 @@ impl MacWindow {
                 frame_source: None,
                 frame_requests_active: Arc::new(AtomicBool::new(false)),
                 renderer,
+                #[cfg(not(feature = "wgpu"))]
+                scene_overlay: None,
                 force_render_pending: false,
                 request_frame_callback: None,
                 event_callback: None,
@@ -1580,6 +1731,10 @@ impl Drop for MacWindow {
     fn drop(&mut self) {
         let mut this = self.0.lock();
         this.renderer.destroy();
+        #[cfg(not(feature = "wgpu"))]
+        if let Some(overlay) = this.scene_overlay.as_ref() {
+            overlay.renderer.destroy();
+        }
         let window = this.native_window;
         let sheet_parent = this.sheet_parent.take();
         this.frame_source.take();
@@ -2250,6 +2405,138 @@ impl PlatformWindow for MacWindow {
         this.renderer.draw(scene);
     }
 
+    #[cfg(not(feature = "wgpu"))]
+    fn draw_layered(
+        &self,
+        scene: &gpui::Scene,
+        overlay_start: usize,
+        overlay_captures_input: bool,
+    ) {
+        let mut state = self.0.lock();
+        if state.scene_overlay.is_none() {
+            state.renderer.draw(scene);
+            return;
+        }
+
+        let scale_factor = state.scale_factor();
+        let drawable_size = state.content_size().to_device_pixels(scale_factor);
+        let overlay_scene = if overlay_start < scene.len() {
+            let (base, overlay) = scene.split_at(overlay_start);
+            state.renderer.draw(&base);
+            Some(overlay).filter(|overlay| overlay.has_primitives())
+        } else {
+            state.renderer.draw(scene);
+            None
+        };
+
+        let overlay = state.scene_overlay.as_mut().expect("checked above");
+        let captures_input = overlay_scene.is_some() && overlay_captures_input;
+        let began_capturing = !overlay
+            .captures_input
+            .swap(captures_input, Ordering::AcqRel)
+            && captures_input;
+        if let Some(overlay_scene) = &overlay_scene {
+            overlay.update_drawable_size(drawable_size, scale_factor);
+            overlay.renderer.draw(overlay_scene);
+        }
+        overlay.set_visible(overlay_scene.is_some());
+
+        let native_window = state.native_window;
+        let native_view = state.native_view.as_ptr();
+        drop(state);
+
+        unsafe {
+            // Commit the transaction-presented drawables now rather than at the end of the run
+            // loop turn. Otherwise display callbacks can keep requesting drawables before any
+            // are returned and exhaust the layer's pool.
+            let _: () = msg_send![class!(CATransaction), flush];
+            // A menu or prompt opening over a focused native child takes keyboard focus back,
+            // so keyboard navigation reaches GPUI. Passive overlays leave focus alone.
+            if began_capturing {
+                native_window.makeFirstResponder_(native_view);
+            }
+        }
+    }
+
+    #[cfg(not(feature = "wgpu"))]
+    fn enable_scene_overlay(&self) -> anyhow::Result<()> {
+        let mut state = self.0.lock();
+        if state.scene_overlay.is_some() {
+            return Ok(());
+        }
+
+        unsafe {
+            let parent = state.native_view.as_ptr();
+            let bounds: Objc2NSRect = msg_send![parent, bounds];
+
+            let native_host: ObjcId = msg_send![&*NATIVE_HOST_VIEW_CLASS, alloc];
+            let native_host: ObjcId = msg_send![native_host, initWithFrame: bounds];
+            anyhow::ensure!(
+                !native_host.is_null(),
+                "failed to create the native host view"
+            );
+            native_host.setAutoresizingMask_(VIEW_WIDTH_SIZABLE | VIEW_HEIGHT_SIZABLE);
+
+            let view: ObjcId = msg_send![&*OVERLAY_VIEW_CLASS, alloc];
+            let view: ObjcId = msg_send![view, initWithFrame: bounds];
+            if view.is_null() {
+                let _: () = msg_send![native_host, release];
+                anyhow::bail!("failed to create the scene overlay view");
+            }
+            set_window_state_ivar(view, Arc::into_raw(self.0.clone()) as *mut c_void);
+            let captures_input = Arc::new(AtomicBool::new(false));
+            let object = &mut *view;
+            *overlay_captures_input_ivar(object).load_mut::<*const c_void>(object) =
+                Arc::into_raw(captures_input.clone()) as *const c_void;
+
+            let renderer = state.renderer.new_overlay();
+            view.setAutoresizingMask_(VIEW_WIDTH_SIZABLE | VIEW_HEIGHT_SIZABLE);
+            view.setWantsLayer(Bool::new(true));
+            let _: () = msg_send![view, setLayer: renderer.layer_ptr() as ObjcId];
+            // Metal fills the layer; AppKit must never replace its contents.
+            let _: () = msg_send![
+                view,
+                setLayerContentsRedrawPolicy: NSViewLayerContentsRedrawPolicy::Never
+            ];
+            let _: () = msg_send![view, setHidden: Bool::new(true)];
+
+            parent.addSubview_(native_host.autorelease());
+            parent.addSubview_(view.autorelease());
+
+            let mut overlay = SceneOverlay {
+                renderer,
+                view: NonNull::new_unchecked(view),
+                native_host: NonNull::new_unchecked(native_host),
+                captures_input,
+                visible: false,
+                drawable_size: Size::default(),
+                scale_factor: 0.,
+            };
+            let scale_factor = state.scale_factor();
+            overlay.update_drawable_size(
+                state.content_size().to_device_pixels(scale_factor),
+                scale_factor,
+            );
+            state.scene_overlay = Some(overlay);
+        }
+        state.set_presents_with_transaction(true);
+        Ok(())
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn enable_scene_overlay(&self) -> anyhow::Result<()> {
+        anyhow::bail!("native scene overlays require the Metal renderer, not the `wgpu` feature")
+    }
+
+    #[cfg(not(feature = "wgpu"))]
+    fn native_composition(&self) -> Option<gpui::NativeComposition> {
+        let state = self.0.lock();
+        let overlay = state.scene_overlay.as_ref()?;
+        Some(gpui::NativeComposition::AppKit {
+            view: overlay.native_host.cast(),
+        })
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.0.lock().renderer.sprite_atlas().clone()
     }
@@ -2672,6 +2959,72 @@ unsafe extern "C" fn dealloc_view(this: &Objc2Object, _: Sel) {
     unsafe {
         drop_window_state(this);
         let _: () = msg_send![super(this, class!(NSView)), dealloc];
+    }
+}
+
+unsafe fn overlay_captures_input_ivar(object: &Objc2Object) -> &'static objc2::runtime::Ivar {
+    let name = CString::new(OVERLAY_CAPTURES_INPUT_IVAR).unwrap();
+    object.class().instance_variable(name.as_c_str()).unwrap()
+}
+
+unsafe extern "C" fn dealloc_overlay_view(this: &Objc2Object, _: Sel) {
+    unsafe {
+        let captures_input: *const c_void = *overlay_captures_input_ivar(this).load(this);
+        if !captures_input.is_null() {
+            drop(Arc::from_raw(captures_input as *const AtomicBool));
+        }
+        drop_window_state(this);
+        let _: () = msg_send![super(this, class!(NSView)), dealloc];
+    }
+}
+
+/// Interactive overlay content (menus, prompts, drag previews) takes every click in the view,
+/// including over native children, just as it would in a window without them. Otherwise the
+/// overlay is transparent to the pointer, so native children and `GPUIView` receive events.
+unsafe extern "C" fn overlay_view_hit_test(
+    this: &Objc2Object,
+    _: Sel,
+    point: Objc2NSPoint,
+) -> ObjcId {
+    unsafe {
+        let captures_input: *const c_void = *overlay_captures_input_ivar(this).load(this);
+        if captures_input.is_null()
+            || !(*(captures_input as *const AtomicBool)).load(Ordering::Acquire)
+        {
+            return NIL;
+        }
+        // `point` is in the superview's coordinate system, like `frame`.
+        let frame: Objc2NSRect = msg_send![this, frame];
+        let inside = point.x >= frame.origin.x
+            && point.y >= frame.origin.y
+            && point.x < frame.origin.x + frame.size.width
+            && point.y < frame.origin.y + frame.size.height;
+        if inside {
+            this as *const Objc2Object as ObjcId
+        } else {
+            NIL
+        }
+    }
+}
+
+unsafe extern "C" fn overlay_view_event(this: &Objc2Object, selector: Sel, native_event: ObjcId) {
+    // Handle the event exactly as `GPUIView` would, including its input-context processing.
+    let native_view = unsafe { get_window_state(this) }.lock().native_view;
+    unsafe { handle_view_event(native_view.as_ref(), selector, native_event) }
+}
+
+unsafe extern "C" fn native_host_view_hit_test(
+    this: &Objc2Object,
+    _: Sel,
+    point: Objc2NSPoint,
+) -> ObjcId {
+    unsafe {
+        let hit: ObjcId = msg_send![super(this, class!(NSView)), hitTest: point];
+        if hit == this as *const Objc2Object as ObjcId {
+            NIL
+        } else {
+            hit
+        }
     }
 }
 
@@ -3345,7 +3698,7 @@ unsafe extern "C" fn window_did_change_key_status(this: &Objc2Object, selector: 
 
         if lock.activated_least_once {
             if let Some(mut callback) = lock.request_frame_callback.take() {
-                lock.renderer.set_presents_with_transaction(true);
+                lock.set_presents_with_transaction(true);
                 lock.stop_display_link();
                 let request = lock.next_frame_request();
                 drop(lock);
@@ -3353,7 +3706,7 @@ unsafe extern "C" fn window_did_change_key_status(this: &Objc2Object, selector: 
 
                 let mut lock = window_state.lock();
                 lock.request_frame_callback = Some(callback);
-                lock.renderer.set_presents_with_transaction(false);
+                lock.set_presents_with_transaction(false);
                 lock.start_display_link();
             }
         } else {
@@ -3469,7 +3822,7 @@ unsafe extern "C" fn display_layer(this: &Objc2Object, _: Sel, _: ObjcId) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();
     if let Some(mut callback) = lock.request_frame_callback.take() {
-        lock.renderer.set_presents_with_transaction(true);
+        lock.set_presents_with_transaction(true);
         lock.stop_display_link();
         let request = lock.next_frame_request();
         drop(lock);
@@ -3477,7 +3830,7 @@ unsafe extern "C" fn display_layer(this: &Objc2Object, _: Sel, _: ObjcId) {
 
         let mut lock = window_state.lock();
         lock.request_frame_callback = Some(callback);
-        lock.renderer.set_presents_with_transaction(false);
+        lock.set_presents_with_transaction(false);
         lock.start_display_link();
     }
 }
