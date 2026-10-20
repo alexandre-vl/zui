@@ -99,6 +99,13 @@ fn quantize_color_glyph_origin(origin: Point<ScaledPixels>) -> (Point<ScaledPixe
     )
 }
 
+/// Compositing effects for [`Window::paint_glyph_transformed`].
+#[derive(Clone, Copy)]
+struct GlyphEffect {
+    transformation: TransformationMatrix,
+    blur_radius: ScaledPixels,
+}
+
 /// Default window size used when no explicit size is provided.
 pub const DEFAULT_WINDOW_SIZE: Size<Pixels> = size(px(1536.), px(1095.));
 
@@ -5342,7 +5349,53 @@ impl Window {
             raster_style,
         };
 
-        self.paint_glyph_from_atlas(integer_origin, params, color)
+        self.paint_glyph_from_atlas(integer_origin, params, color, None)
+    }
+
+    /// Paints a monochrome glyph like [`Self::paint_glyph`], transformed by `transformation`
+    /// when composited and blurred by a gaussian whose standard deviation is `blur_radius`.
+    ///
+    /// The transformation applies to the glyph's quad in device pixels, so it can scale or
+    /// rotate the glyph about any point without rasterizing it again: animating it never
+    /// adds atlas entries. The blur applies before the transformation. The glyph always
+    /// renders as a grayscale mask, since subpixel masks cannot be transformed or blurred.
+    /// Color glyphs, such as emoji, are painted without the transformation or blur.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_glyph_transformed(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        color: Hsla,
+        transformation: TransformationMatrix,
+        blur_radius: Pixels,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let (integer_origin, subpixel_variant) = quantize_glyph_origin(origin.scale(scale_factor));
+        let raster_style = self.text_system().prepare_raster_style(
+            font_id,
+            glyph_id,
+            color,
+            GlyphRenderMode::Grayscale,
+        );
+        let params = RenderGlyphParams {
+            font_id,
+            glyph_id,
+            font_size,
+            subpixel_variant,
+            scale_factor,
+            raster_style,
+        };
+        let effect = GlyphEffect {
+            transformation,
+            blur_radius: blur_radius.scale(scale_factor).max(ScaledPixels(0.)),
+        };
+
+        self.paint_glyph_from_atlas(integer_origin, params, color, Some(effect))
     }
 
     fn paint_glyph_from_atlas(
@@ -5350,6 +5403,7 @@ impl Window {
         integer_origin: Point<ScaledPixels>,
         params: RenderGlyphParams,
         mask_color: Hsla,
+        effect: Option<GlyphEffect>,
     ) -> Result<()> {
         let text_system = self.text_system().clone();
         let entry = self
@@ -5366,11 +5420,11 @@ impl Window {
         };
         let content_mask = self.snapped_content_mask();
 
-        match entry.format {
-            RasterizedGlyphFormat::AlphaMask => {
+        match (entry.format, effect) {
+            (RasterizedGlyphFormat::AlphaMask, None) => {
                 self.next_frame.scene.insert_primitive(MonochromeSprite {
                     order: 0,
-                    padding: 0,
+                    blur_radius: ScaledPixels(0.),
                     bounds,
                     content_mask,
                     color: mask_color.into(),
@@ -5378,7 +5432,24 @@ impl Window {
                     transformation: TransformationMatrix::unit(),
                 });
             }
-            RasterizedGlyphFormat::BgraSubpixelMask => {
+            // The monochrome pipeline reads one channel of a subpixel mask, should a
+            // rasterizer return one despite the grayscale request.
+            (
+                RasterizedGlyphFormat::AlphaMask | RasterizedGlyphFormat::BgraSubpixelMask,
+                Some(effect),
+            ) => {
+                let margin = MonochromeSprite::blur_margin(effect.blur_radius);
+                self.next_frame.scene.insert_primitive(MonochromeSprite {
+                    order: 0,
+                    blur_radius: effect.blur_radius,
+                    bounds: bounds.dilate(margin),
+                    content_mask,
+                    color: mask_color.into(),
+                    tile,
+                    transformation: effect.transformation,
+                });
+            }
+            (RasterizedGlyphFormat::BgraSubpixelMask, None) => {
                 self.next_frame.scene.insert_primitive(SubpixelSprite {
                     order: 0,
                     padding: 0,
@@ -5389,7 +5460,7 @@ impl Window {
                     transformation: TransformationMatrix::unit(),
                 });
             }
-            RasterizedGlyphFormat::BgraColor => {
+            (RasterizedGlyphFormat::BgraColor, _) => {
                 self.next_frame.scene.insert_primitive(PolychromeSprite {
                     order: 0,
                     grayscale: false.into(),
@@ -5479,7 +5550,7 @@ impl Window {
             raster_style,
         };
 
-        self.paint_glyph_from_atlas(integer_origin, params, color)
+        self.paint_glyph_from_atlas(integer_origin, params, color, None)
     }
 
     /// Paint a monochrome SVG into the scene for the next frame at the current stacking context.
@@ -5535,7 +5606,7 @@ impl Window {
 
         self.next_frame.scene.insert_primitive(MonochromeSprite {
             order: 0,
-            padding: 0,
+            blur_radius: ScaledPixels(0.),
             bounds: final_bounds,
             content_mask,
             color: color.into(),
@@ -8852,6 +8923,87 @@ mod tests {
                 RasterColorEffect::Preblend(crate::Rgba8::new(31, 88, 173, 204)),
                 RasterColorEffect::Preblend(crate::Rgba8::new(122, 86, 31, 204)),
             ]
+        );
+    }
+
+    struct TransformedGlyphView;
+
+    fn glyph_rotation() -> TransformationMatrix {
+        TransformationMatrix::unit().rotate(crate::radians(0.5))
+    }
+
+    impl Render for TransformedGlyphView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            canvas(
+                |_, _, _| (),
+                move |_, _, window, _| {
+                    let origin = point(px(20.), px(20.));
+                    let color = hsla(0.6, 0.7, 0.4, 1.);
+                    window
+                        .paint_glyph(origin, FontId(7), GlyphId(1), px(16.), color)
+                        .unwrap();
+                    window
+                        .paint_glyph_transformed(
+                            origin,
+                            FontId(7),
+                            GlyphId(1),
+                            px(16.),
+                            color,
+                            glyph_rotation(),
+                            px(2.),
+                        )
+                        .unwrap();
+                    // Color glyphs ignore the effect.
+                    window
+                        .paint_glyph_transformed(
+                            origin,
+                            FontId(7),
+                            GlyphId(3),
+                            px(16.),
+                            color,
+                            glyph_rotation(),
+                            px(2.),
+                        )
+                        .unwrap();
+                },
+            )
+            .size_full()
+        }
+    }
+
+    #[test]
+    fn transformed_glyphs_carry_their_transformation_and_blur() {
+        let text_system = Arc::new(RasterFormatTextSystem::default());
+        let mut app = TestApp::with_text_system(text_system.clone());
+        let mut test_window = app.open_window(|_, _| TransformedGlyphView);
+        test_window.draw();
+
+        test_window.update(|_, window, _| {
+            let scale = window.scale_factor();
+            let scene = &window.rendered_frame.scene;
+            assert_eq!(scene.monochrome_sprites.len(), 2);
+            let [plain, transformed] = [&scene.monochrome_sprites[0], &scene.monochrome_sprites[1]];
+
+            assert_eq!(plain.blur_radius, ScaledPixels(0.));
+            assert_eq!(plain.transformation, TransformationMatrix::unit());
+            assert_eq!(transformed.blur_radius, ScaledPixels(2. * scale));
+            assert_eq!(transformed.transformation, glyph_rotation());
+            assert_eq!(
+                transformed.bounds,
+                plain.bounds.dilate(ScaledPixels(6. * scale)),
+                "the quad leaves room for three standard deviations of blur"
+            );
+            assert_eq!(transformed.tile.bounds.size, plain.tile.bounds.size);
+
+            assert_eq!(scene.polychrome_sprites.len(), 1);
+        });
+
+        let rasterized = text_system.rasterized.lock().unwrap();
+        assert!(
+            rasterized
+                .iter()
+                .filter(|params| params.glyph_id == GlyphId(1))
+                .any(|params| params.raster_style.mode == GlyphRenderMode::Grayscale)
         );
     }
 

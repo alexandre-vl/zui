@@ -3300,7 +3300,7 @@ mod tests {
         });
         scene.insert_primitive(MonochromeSprite {
             order: 0,
-            padding: 0,
+            blur_radius: ScaledPixels(0.0),
             bounds: scaled(10.0, 60.0, 30.0, 30.0),
             content_mask: full_mask(),
             color: green.into(),

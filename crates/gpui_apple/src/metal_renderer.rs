@@ -2600,7 +2600,7 @@ mod tests {
         let mut scene = Scene::default();
         scene.insert_primitive(MonochromeSprite {
             order: 0,
-            padding: 0,
+            blur_radius: ScaledPixels(0.0),
             bounds,
             content_mask: ContentMask {
                 bounds,

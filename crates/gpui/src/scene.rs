@@ -144,7 +144,7 @@ impl Scene {
         {
             primitive = Primitive::MonochromeSprite(MonochromeSprite {
                 order: sprite.order,
-                padding: sprite.padding,
+                blur_radius: ScaledPixels(0.),
                 bounds: sprite.bounds,
                 content_mask: sprite.content_mask,
                 color: sprite.color,
@@ -1092,13 +1092,27 @@ impl Default for TransformationMatrix {
 #[expect(missing_docs)]
 pub struct MonochromeSprite {
     pub order: DrawOrder,
-    pub padding: u32,
+    /// Standard deviation of a gaussian blur applied to the sprite's coverage, in device
+    /// pixels, before `transformation`. Zero samples the tile directly. A blurred sprite's
+    /// `bounds` include a margin of three standard deviations on every side around the
+    /// tile; see [`MonochromeSprite::blur_margin`].
+    pub blur_radius: ScaledPixels,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub color: SceneHsla,
     pub tile: AtlasTile,
     pub transformation: TransformationMatrix,
 }
+
+impl MonochromeSprite {
+    /// The margin a sprite blurred by `blur_radius` needs around its tile on every side.
+    pub fn blur_margin(blur_radius: ScaledPixels) -> ScaledPixels {
+        ScaledPixels(GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS * blur_radius.0.max(0.))
+    }
+}
+
+/// Gaussian blurs are truncated this many standard deviations from their center.
+const GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS: f32 = 3.0;
 
 impl From<MonochromeSprite> for Primitive {
     fn from(sprite: MonochromeSprite) -> Self {

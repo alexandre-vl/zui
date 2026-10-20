@@ -169,7 +169,7 @@ fn every_primitive_kind_renders() {
     let mono_bounds = bounds(10.0, 60.0, 30.0, 30.0);
     scene.insert_primitive(MonochromeSprite {
         order: 0,
-        padding: 0,
+        blur_radius: ScaledPixels(0.0),
         bounds: mono_bounds,
         content_mask: full_mask(),
         color: green.into(),
@@ -728,4 +728,88 @@ fn rounded_content_masks_clip_corners_per_pixel() {
         .filter(|&(x, y)| (1..255).contains(&pixel(x, y)[0]))
         .count();
     assert!(partial >= 10, "only {partial} antialiased arc pixels");
+}
+
+#[test]
+fn monochrome_sprites_blur_and_transform() {
+    let mut renderer = WgpuHeadlessRenderer::new().expect("headless renderer");
+    let mono = tile(
+        &renderer,
+        AtlasKey::Svg(RenderSvgParams {
+            path: "test-blur".into(),
+            size: Size {
+                width: DevicePixels(8),
+                height: DevicePixels(8),
+            },
+        }),
+        vec![255; 64],
+    );
+    let white: Hsla = gpui::rgb_to_hsla(gpui::rgb(0xffffff));
+    let sprite = |bounds, blur_radius: f32, transformation| MonochromeSprite {
+        order: 0,
+        blur_radius: ScaledPixels(blur_radius),
+        bounds,
+        content_mask: full_mask(),
+        color: white.into(),
+        tile: mono,
+        transformation,
+    };
+
+    let mut scene = Scene::default();
+    // A crisp and a blurred 20px square, the blurred one inflated by its 3σ margin.
+    scene.insert_primitive(sprite(
+        bounds(10.0, 20.0, 20.0, 20.0),
+        0.0,
+        Default::default(),
+    ));
+    let blurred = bounds(60.0, 20.0, 20.0, 20.0);
+    scene.insert_primitive(sprite(
+        blurred.dilate(MonochromeSprite::blur_margin(ScaledPixels(2.0))),
+        2.0,
+        Default::default(),
+    ));
+    // A crisp square scaled 2x about its center.
+    let center = gpui::point(ScaledPixels(130.0), ScaledPixels(30.0));
+    let scale_about_center = gpui::TransformationMatrix::unit()
+        .translate(center)
+        .scale(gpui::size(2.0, 2.0))
+        .translate(gpui::point(
+            ScaledPixels(-center.x.0),
+            ScaledPixels(-center.y.0),
+        ));
+    scene.insert_primitive(sprite(
+        bounds(120.0, 20.0, 20.0, 20.0),
+        0.0,
+        scale_about_center,
+    ));
+    scene.finish();
+
+    let image = renderer
+        .render_scene_to_image(&scene, TARGET)
+        .expect("render must succeed");
+    let value = |x: u32, y: u32| image.get_pixel(x, y).0[0];
+
+    // Crisp edges stay crisp.
+    assert_eq!(value(20, 30), 255);
+    assert_eq!(value(8, 30), 0);
+    // The blurred square keeps a solid center, ramps across its edge, and spills a halo
+    // outside its unblurred bounds.
+    assert!(value(70, 30) >= 250, "center {}", value(70, 30));
+    let profile: Vec<u8> = (52..72).map(|x| value(x, 30)).collect();
+    assert!(
+        profile
+            .windows(2)
+            .all(|pair| pair[0] < pair[1] || (pair[0] == pair[1] && matches!(pair[0], 0 | 255))),
+        "the blurred edge must ramp smoothly: {profile:?}"
+    );
+    let edge = value(60, 30);
+    let halo = value(57, 30);
+    assert!((60..250).contains(&edge), "edge {edge}");
+    assert!((1..edge).contains(&halo), "halo {halo}");
+    assert!(value(53, 30) < halo, "the halo fades out");
+    assert_eq!(value(52, 30), 0, "nothing beyond the margin");
+    // The scaled square covers 110..150 × 10..50.
+    assert_eq!(value(116, 16), 255);
+    assert_eq!(value(144, 44), 255);
+    assert_eq!(value(108, 30), 0);
 }
