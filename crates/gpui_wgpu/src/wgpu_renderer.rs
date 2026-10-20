@@ -1,5 +1,6 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext, WgpuContextHandle, WgpuDeviceRequirements};
 use gpui::{DevicePixels, GpuSpecs, Scene, Size};
+use gpui_render::filter_targets::FilterTargetRetention;
 
 #[cfg(test)]
 use gpui::BackdropFilter;
@@ -66,6 +67,7 @@ pub struct WgpuRenderer {
     dual_source_blending: bool,
     adapter_info: wgpu::AdapterInfo,
     uploaded_globals: Option<frame::GlobalUniformState>,
+    filter_target_retention: FilterTargetRetention,
     faults: GpuFaultState,
 }
 
@@ -125,6 +127,7 @@ impl WgpuRenderer {
             dual_source_blending,
             adapter_info,
             uploaded_globals: None,
+            filter_target_retention: FilterTargetRetention::default(),
             faults: GpuFaultState {
                 pending_error: last_error,
                 consecutive_failed_frames: 0,
@@ -847,6 +850,58 @@ mod tests {
                 "renderer {renderer_idx}: blurred stripes still differ by {ripple} half a period apart"
             );
         }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
+    #[test]
+    fn idle_filter_targets_are_released_and_recreated() -> anyhow::Result<()> {
+        use gpui_render::filter_targets::FILTER_TARGET_IDLE_FRAMES;
+
+        let context = WgpuContext::new_headless(None)?;
+        let size = gpui::size(DevicePixels(8), DevicePixels(8));
+        let mut renderer = WgpuRenderer::new_headless(&context, size)?;
+        let bounds = test_bounds(0.0, 0.0, 8.0, 8.0);
+        let allocations = |renderer: &WgpuRenderer| {
+            let resources = renderer.resources();
+            (
+                resources.scene_color_texture.is_some(),
+                resources.blur_ping_texture.is_some() && resources.blur_pong_texture.is_some(),
+                resources.filter_group_textures.len(),
+            )
+        };
+
+        let mut blurred = Scene::default();
+        blurred.insert_primitive(test_quad(bounds, bounds, red()));
+        blurred.insert_primitive(backdrop_blur(bounds, 2.0));
+        blurred.finish();
+        let mut grouped = Scene::default();
+        test_group(&mut grouped, bounds, 0.5, smallvec![], |scene| {
+            scene.insert_primitive(test_quad(bounds, bounds, red()));
+        });
+        grouped.finish();
+        let mut plain = Scene::default();
+        plain.insert_primitive(test_quad(bounds, bounds, red()));
+        plain.finish();
+
+        let expected = renderer.render_to_image(&blurred)?;
+        assert_eq!(allocations(&renderer), (true, true, 0));
+
+        // An opacity group still needs the offscreen target, but not the blur scratch.
+        for _ in 1..FILTER_TARGET_IDLE_FRAMES {
+            renderer.render_to_image(&grouped)?;
+        }
+        assert_eq!(allocations(&renderer), (true, true, 1));
+        renderer.render_to_image(&grouped)?;
+        assert_eq!(allocations(&renderer), (true, false, 1));
+
+        for _ in 0..FILTER_TARGET_IDLE_FRAMES {
+            renderer.render_to_image(&plain)?;
+        }
+        assert_eq!(allocations(&renderer), (false, false, 0));
+
+        assert_eq!(renderer.render_to_image(&blurred)?, expected);
+        assert_eq!(allocations(&renderer), (true, true, 0));
         Ok(())
     }
 

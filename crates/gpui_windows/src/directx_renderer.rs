@@ -13,6 +13,7 @@ use gpui_render::{
         GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS, ScissorRectangle, downsampled_dimension,
         visible_composite_region,
     },
+    filter_targets::{FilterTargetRetention, FilterTargets},
     path_types::{PathRasterizationVertex, PathSprite},
     shaders::{
         common::{FontRasterizationUniforms, GlobalUniforms, ShaderBool, SurfaceColorFormat},
@@ -91,6 +92,7 @@ pub(crate) struct DirectXRenderer {
     active_render_target: Option<ID3D11RenderTargetView>,
     path_rasterization_vertices: Vec<PathRasterizationVertex>,
     path_sprites: Vec<PathSprite>,
+    filter_target_retention: FilterTargetRetention,
 }
 
 /// Direct3D objects
@@ -318,6 +320,7 @@ impl DirectXRenderer {
             active_render_target: None,
             path_rasterization_vertices: Vec::new(),
             path_sprites: Vec::new(),
+            filter_target_retention: FilterTargetRetention::default(),
         })
     }
 
@@ -493,6 +496,10 @@ impl DirectXRenderer {
         let device = &self.devices.as_ref().context("devices missing")?.device;
         let resources = self.resources.as_mut().context("resources missing")?;
         resources.retain_surface_views(&scene.surfaces);
+        resources.release_filter_targets(
+            self.filter_target_retention
+                .record_frame(FilterTargets::required_by(requirements)),
+        );
 
         if requirements.uses_path_target {
             resources.ensure_path_resources(device)?;
@@ -1532,6 +1539,23 @@ impl DirectXResources {
         self.blur = None;
         self.viewport = viewport;
         Ok(())
+    }
+
+    /// Drops the filter targets in `targets`; they are recreated on demand.
+    fn release_filter_targets(&mut self, targets: FilterTargets) {
+        if targets.offscreen {
+            self.blur = None;
+        } else if let Some(blur) = self.blur.as_mut() {
+            if targets.blur {
+                blur.scratch = None;
+            }
+            if targets.backdrop_snapshot {
+                blur.snapshot = None;
+            }
+            if targets.isolated_groups {
+                blur.groups.clear();
+            }
+        }
     }
 
     fn ensure_blur_resources(
@@ -2822,6 +2846,7 @@ mod tests {
         ScaledFilter, ScaledPixels, Scene, ShaderBool, Size, WindowBackgroundAppearance, hsla, rgb,
         rgb_to_hsla, solid_background, white,
     };
+    use gpui_render::filter_targets::FILTER_TARGET_IDLE_FRAMES;
     use smallvec::{SmallVec, smallvec};
     use std::borrow::Cow;
     use windows::Win32::Foundation::HWND;
@@ -3087,7 +3112,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_targets_are_allocated_on_demand_and_reset_on_resize() -> Result<()> {
+    fn filter_targets_are_allocated_on_demand_and_released_when_unused() -> Result<()> {
         let window = HiddenWindow::new()?;
         let devices = DirectXDevices::new()?;
         let mut renderer = DirectXRenderer::new(window.0, &devices, true)?;
@@ -3160,6 +3185,21 @@ mod tests {
 
         renderer.render(&ordinary, WindowBackgroundAppearance::Opaque)?;
         assert_eq!(allocations(&renderer), None);
+
+        // Targets that frames stop using are released after a grace period.
+        renderer.render(&filtered, WindowBackgroundAppearance::Opaque)?;
+        renderer.render(&nested, WindowBackgroundAppearance::Opaque)?;
+        assert_eq!(allocations(&renderer), Some((3, true, true)));
+        for _ in 1..FILTER_TARGET_IDLE_FRAMES {
+            renderer.render(&nested, WindowBackgroundAppearance::Opaque)?;
+        }
+        assert_eq!(allocations(&renderer), Some((3, false, false)));
+        for _ in 0..FILTER_TARGET_IDLE_FRAMES {
+            renderer.render(&ordinary, WindowBackgroundAppearance::Opaque)?;
+        }
+        assert_eq!(allocations(&renderer), None);
+        renderer.render(&filtered, WindowBackgroundAppearance::Opaque)?;
+        assert_eq!(allocations(&renderer), Some((1, true, true)));
 
         Ok(())
     }
