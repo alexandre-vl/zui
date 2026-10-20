@@ -11,8 +11,8 @@ use gpui_render::{
     TargetStack,
     artifacts::{NATIVE_SHADERS, NativeShader},
     blur::{
-        BlurAxis, BlurKernel, BlurUniforms, GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS, ScissorRectangle,
-        downsampled_dimension,
+        BlurPlan, BlurUniforms, FilterSource, GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS,
+        ScissorRectangle, downsampled_dimension, visible_composite_region,
     },
     path_types::{self, PathRasterizationVertex},
     shaders::{
@@ -1460,77 +1460,69 @@ impl MetalRenderer {
 
         let full_width = i32::from(viewport_size.width).max(0) as u32;
         let full_height = i32::from(viewport_size.height).max(0) as u32;
-        let blur_size = [
-            downsampled_dimension(full_width) as f32,
-            downsampled_dimension(full_height) as f32,
-        ];
-        let blur_viewport_size = Size {
-            width: DevicePixels(blur_size[0] as i32),
-            height: DevicePixels(blur_size[1] as i32),
+        let target_size = [full_width, full_height];
+        // Content blur bleeds ~3·radius past the box; composite over a dilated rect.
+        let composite_bounds = if clip_rounded {
+            bounds
+        } else {
+            bounds.dilate(ScaledPixels(
+                GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS * blur_radius,
+            ))
         };
-        let dilation = GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS * blur_radius;
-        let scissor =
-            ScissorRectangle::for_blurred_bounds(bounds, dilation, full_width, full_height);
-        if scissor.is_empty() {
+        let Some(region) = visible_composite_region(composite_bounds, content_mask, target_size)
+        else {
             return;
-        }
+        };
         let clip = if clip_rounded {
             gpui_render::blur::FilterCompositeClip::RoundedBounds
         } else {
             gpui_render::blur::FilterCompositeClip::ContentShape
         };
 
-        let full_size = [full_width as f32, full_height as f32];
-        let (composite_source, source_size) =
-            if let Some(kernel) = BlurKernel::for_radius(blur_radius) {
+        let (composite_source, filter_source) =
+            if let Some(plan) = BlurPlan::new(blur_radius, region, target_size) {
                 let (Some(ping), Some(pong)) = (ping, pong) else {
                     return;
                 };
+                let blur_viewport_size = Size {
+                    width: DevicePixels(plan.result.texture_size[0] as i32),
+                    height: DevicePixels(plan.result.texture_size[1] as i32),
+                };
                 // Downsample source -> ping, then separable gaussian ping -> pong -> ping.
-                self.run_metal_blur_pass(
-                    command_buffer,
-                    &self.blur_downsample_pipeline_state,
-                    ping,
-                    source,
-                    blur_viewport_size,
-                    scene_uniforms,
-                    BlurUniforms::downsample([full_width as f32, full_height as f32], blur_size),
-                    scissor,
-                    metal::MTLPrimitiveType::Triangle,
-                    3,
-                    false,
-                );
-
-                for (axis, source, target) in [
-                    (BlurAxis::Horizontal, ping, pong),
-                    (BlurAxis::Vertical, pong, ping),
+                for (pipeline, pass, source, target) in [
+                    (
+                        &self.blur_downsample_pipeline_state,
+                        plan.downsample,
+                        source,
+                        ping,
+                    ),
+                    (&self.blur_pipeline_state, plan.horizontal, ping, pong),
+                    (&self.blur_pipeline_state, plan.vertical, pong, ping),
                 ] {
                     self.run_metal_blur_pass(
                         command_buffer,
-                        &self.blur_pipeline_state,
+                        pipeline,
                         target,
                         source,
                         blur_viewport_size,
                         scene_uniforms,
-                        BlurUniforms::gaussian(axis, blur_size, kernel),
-                        scissor,
+                        pass.uniforms,
+                        pass.scissor,
                         metal::MTLPrimitiveType::Triangle,
                         3,
                         false,
                     );
                 }
 
-                (ping, blur_size)
+                (ping, plan.result)
             } else {
-                (source, full_size)
+                (
+                    source,
+                    FilterSource::full_resolution(full_width, full_height),
+                )
             };
 
         // Composite the blurred result into the target (preserving its contents).
-        let composite_bounds = if clip_rounded {
-            bounds
-        } else {
-            bounds.dilate(ScaledPixels(dilation))
-        };
         let composite_uniforms = BlurUniforms::composite(
             composite_bounds,
             content_mask,
@@ -1538,8 +1530,7 @@ impl MetalRenderer {
             corner_smoothing,
             opacity,
             clip,
-            source_size,
-            full_size,
+            filter_source,
         );
         let encoder = new_command_encoder_for_texture(
             command_buffer,

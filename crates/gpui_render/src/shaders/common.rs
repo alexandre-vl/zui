@@ -107,7 +107,8 @@ mod source {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Wgsl)]
     pub enum DownsampleMode {
         Copy = 0,
-        HalfResolution = 1,
+        /// Average the block of source texels under each target texel.
+        Box = 1,
     }
 
     #[repr(C)]

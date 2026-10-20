@@ -9,8 +9,9 @@ use gpui_render::{
     InstanceRange, TargetStack,
     artifacts::{Dx11DrawConstants, Dx11DrawConstantsBinding},
     blur::{
-        BlurAxis, BlurKernel, BlurUniforms, FilterCompositeClip,
-        GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS, downsampled_dimension,
+        BlurPlan, BlurUniforms, FilterCompositeClip, FilterSource,
+        GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS, ScissorRectangle, downsampled_dimension,
+        visible_composite_region,
     },
     path_types::{PathRasterizationVertex, PathSprite},
     shaders::{
@@ -1250,72 +1251,7 @@ impl DirectXRenderer {
             return Ok(());
         }
 
-        let full_width = self.width;
-        let full_height = self.height;
-        let blur_size = [
-            downsampled_dimension(full_width) as f32,
-            downsampled_dimension(full_height) as f32,
-        ];
-        let clip = if clip_rounded {
-            FilterCompositeClip::RoundedBounds
-        } else {
-            FilterCompositeClip::ContentShape
-        };
-        let half_vp = D3D11_VIEWPORT {
-            TopLeftX: 0.0,
-            TopLeftY: 0.0,
-            Width: blur_size[0],
-            Height: blur_size[1],
-            MinDepth: 0.0,
-            MaxDepth: 1.0,
-        };
-        let resources = self.resources.as_ref().context("resources missing")?;
-
-        let full_size = [full_width as f32, full_height as f32];
-        let (composite_source, source_size) =
-            if let Some(kernel) = BlurKernel::for_radius(blur_radius) {
-                let [ping, pong] = resources
-                    .blur
-                    .as_ref()
-                    .and_then(|blur| blur.scratch.as_ref())
-                    .context("blur resources were not prepared")?;
-                // Downsample source -> ping, then separable gaussian ping -> pong -> ping.
-                self.dx_blur_pass(
-                    &self.pipelines.blur_downsample_vertex,
-                    &self.pipelines.blur_downsample_fragment,
-                    &self.pipelines.blur_blend_replace,
-                    &ping.target,
-                    source_srv,
-                    BlurUniforms::downsample([full_width as f32, full_height as f32], blur_size),
-                    &half_vp,
-                    D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
-                    3,
-                    true,
-                )?;
-
-                for (axis, source, target) in [
-                    (BlurAxis::Horizontal, &ping.source, &pong.target),
-                    (BlurAxis::Vertical, &pong.source, &ping.target),
-                ] {
-                    self.dx_blur_pass(
-                        &self.pipelines.blur_vertex,
-                        &self.pipelines.blur_fragment,
-                        &self.pipelines.blur_blend_replace,
-                        target,
-                        source,
-                        BlurUniforms::gaussian(axis, blur_size, kernel),
-                        &half_vp,
-                        D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
-                        3,
-                        true,
-                    )?;
-                }
-
-                (&ping.source, blur_size)
-            } else {
-                (source_srv, full_size)
-            };
-
+        let target_size = [self.width, self.height];
         // Content blur bleeds ~3·radius past the box; composite over a dilated rect.
         let composite_bounds = if clip_rounded {
             bounds
@@ -1324,6 +1260,70 @@ impl DirectXRenderer {
                 GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS * blur_radius,
             ))
         };
+        let Some(region) = visible_composite_region(composite_bounds, content_mask, target_size)
+        else {
+            return Ok(());
+        };
+        let clip = if clip_rounded {
+            FilterCompositeClip::RoundedBounds
+        } else {
+            FilterCompositeClip::ContentShape
+        };
+        let resources = self.resources.as_ref().context("resources missing")?;
+
+        let (composite_source, filter_source) =
+            if let Some(plan) = BlurPlan::new(blur_radius, region, target_size) {
+                let [ping, pong] = resources
+                    .blur
+                    .as_ref()
+                    .and_then(|blur| blur.scratch.as_ref())
+                    .context("blur resources were not prepared")?;
+                // Downsample source -> ping, then separable gaussian ping -> pong -> ping.
+                for (vertex, fragment, pass, source, target) in [
+                    (
+                        &self.pipelines.blur_downsample_vertex,
+                        &self.pipelines.blur_downsample_fragment,
+                        plan.downsample,
+                        source_srv,
+                        &ping.target,
+                    ),
+                    (
+                        &self.pipelines.blur_vertex,
+                        &self.pipelines.blur_fragment,
+                        plan.horizontal,
+                        &ping.source,
+                        &pong.target,
+                    ),
+                    (
+                        &self.pipelines.blur_vertex,
+                        &self.pipelines.blur_fragment,
+                        plan.vertical,
+                        &pong.source,
+                        &ping.target,
+                    ),
+                ] {
+                    self.dx_blur_pass(
+                        vertex,
+                        fragment,
+                        &self.pipelines.blur_blend_replace,
+                        target,
+                        source,
+                        pass.uniforms,
+                        &scissor_viewport(pass.scissor),
+                        D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+                        3,
+                        true,
+                    )?;
+                }
+
+                (&ping.source, plan.result)
+            } else {
+                (
+                    source_srv,
+                    FilterSource::full_resolution(target_size[0], target_size[1]),
+                )
+            };
+
         let composite_uniforms = BlurUniforms::composite(
             composite_bounds,
             content_mask,
@@ -1331,8 +1331,7 @@ impl DirectXRenderer {
             corner_smoothing,
             opacity,
             clip,
-            source_size,
-            full_size,
+            filter_source,
         );
         let (composite_vertex, composite_fragment) = if composite_uniforms.corner_smoothing > 0.0 {
             (
@@ -2258,6 +2257,21 @@ fn set_viewport(device_context: &ID3D11DeviceContext, width: f32, height: f32) -
     }];
     unsafe { device_context.RSSetViewports(Some(&viewport)) };
     viewport[0]
+}
+
+/// Restricts a fullscreen blur pass to `scissor`. The blur shaders address texels by their
+/// render-target position rather than by interpolated coordinates, so a viewport covering just
+/// the scissor rectangle produces the same fragments as scissoring, without a second rasterizer
+/// state.
+fn scissor_viewport(scissor: ScissorRectangle) -> D3D11_VIEWPORT {
+    D3D11_VIEWPORT {
+        TopLeftX: scissor.x as f32,
+        TopLeftY: scissor.y as f32,
+        Width: scissor.width as f32,
+        Height: scissor.height as f32,
+        MinDepth: 0.0,
+        MaxDepth: 1.0,
+    }
 }
 
 #[inline]

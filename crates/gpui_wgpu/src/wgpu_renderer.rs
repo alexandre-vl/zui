@@ -6,8 +6,6 @@ use gpui::BackdropFilter;
 #[cfg(all(test, feature = "test-support", not(target_family = "wasm")))]
 use gpui::{Bounds, ColorExt, Quad, ScaledPixels, Underline, blue, red, white};
 #[cfg(test)]
-use gpui_render::blur::{BlurKernel, MAX_GAUSSIAN_SAMPLES_PER_SIDE};
-#[cfg(test)]
 use gpui_render::shaders::interface as shader_interface;
 #[cfg(all(test, feature = "test-support", not(target_family = "wasm")))]
 use smallvec::{SmallVec, smallvec};
@@ -411,14 +409,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn large_blur_radii_expand_tap_spacing_instead_of_truncating_the_kernel() {
-        let kernel = BlurKernel::for_radius(100.0).expect("positive radii have a blur kernel");
-        assert_eq!(kernel.standard_deviation, 50.0);
-        assert_eq!(kernel.sample_count, MAX_GAUSSIAN_SAMPLES_PER_SIDE);
-        assert!(kernel.sample_step > 4.0);
-    }
-
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[test]
     fn desktop_blending_preserves_source_over_alpha() {
@@ -771,6 +761,92 @@ mod tests {
         );
 
         renderer.render_to_image(&scene)?;
+        Ok(())
+    }
+
+    #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
+    fn backdrop_blur(bounds: Bounds<ScaledPixels>, radius: f32) -> BackdropFilter {
+        BackdropFilter {
+            order: 1,
+            bounds,
+            content_mask: gpui::ContentMask {
+                bounds,
+                ..Default::default()
+            },
+            filters: smallvec![gpui::ScaledFilter::Blur(ScaledPixels(radius))],
+            opacity: 1.0,
+            ..Default::default()
+        }
+    }
+
+    #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
+    #[test]
+    fn wide_blurs_keep_solid_backdrops_solid_up_to_the_edges() -> anyhow::Result<()> {
+        // Wide blurs run at a coarser resolution in part of the scratch textures; sampling
+        // must clamp to that part rather than read the unused remainder.
+        let target_size = gpui::size(DevicePixels(97), DevicePixels(61));
+        let full_bounds = test_bounds(0.0, 0.0, 97.0, 61.0);
+        for radius in [8.0, 40.0, 100.0, 300.0] {
+            let mut scene = Scene::default();
+            scene.insert_primitive(test_quad(full_bounds, full_bounds, red()));
+            scene.insert_primitive(backdrop_blur(full_bounds, radius));
+            scene.finish();
+            for (renderer_idx, renderer) in test_renderers()?.iter_mut().enumerate() {
+                let image = renderer.render_scene_to_image(&scene, target_size)?;
+                for (x, y, pixel) in image.enumerate_pixels() {
+                    assert!(
+                        pixel.0[0] >= 253
+                            && pixel.0[1] <= 2
+                            && pixel.0[2] <= 2
+                            && pixel.0[3] == 255,
+                        "renderer {renderer_idx}, radius {radius}: pixel ({x}, {y}) is {:?}",
+                        pixel.0
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
+    #[test]
+    fn wide_blurs_do_not_alias_fine_detail() -> anyhow::Result<()> {
+        // Stripes whose period matches the tap spacing of an undersampled kernel survive such a
+        // blur almost unattenuated. A blur this wide must flatten them completely.
+        let target_size = gpui::size(DevicePixels(320), DevicePixels(48));
+        let full_bounds = test_bounds(0.0, 0.0, 320.0, 48.0);
+        let radius = 100.0;
+        let period = 9.375;
+        let mut scene = Scene::default();
+        scene.insert_primitive(test_quad(full_bounds, full_bounds, gpui::black()));
+        let mut left = 0.0;
+        while left < 320.0 {
+            scene.insert_primitive(test_quad(
+                test_bounds(left, 0.0, period / 2.0, 48.0),
+                full_bounds,
+                white(),
+            ));
+            left += period;
+        }
+        scene.insert_primitive(gpui::BackdropFilter {
+            order: 2,
+            ..backdrop_blur(full_bounds, radius)
+        });
+        scene.finish();
+
+        for (renderer_idx, renderer) in test_renderers()?.iter_mut().enumerate() {
+            let image = renderer.render_scene_to_image(&scene, target_size)?;
+            // Compare pixels half a period apart: the kernel spans the whole target, so edge
+            // clamping may add a gentle gradient, but no stripe may remain.
+            let ripple = (100..220)
+                .map(|x| image.get_pixel(x, 24).0[0].abs_diff(image.get_pixel(x + 5, 24).0[0]))
+                .max()
+                .unwrap();
+            assert!(
+                ripple <= 1,
+                "renderer {renderer_idx}: blurred stripes still differ by {ripple} half a period apart"
+            );
+        }
         Ok(())
     }
 
