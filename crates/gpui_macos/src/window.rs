@@ -37,9 +37,9 @@ use objc2_app_kit::{
     NSAlert, NSAlertStyle, NSBackingStoreType, NSBeep, NSButton as Objc2NSButton,
     NSCursorFrameResizeDirections, NSCursorFrameResizePosition, NSEventModifierFlags, NSEventType,
     NSRequestUserAttentionType, NSScreen, NSView as Objc2NSView, NSViewLayerContentsRedrawPolicy,
-    NSVisualEffectMaterial, NSVisualEffectState, NSWindow as Objc2NSWindow,
-    NSWindowButton as Objc2NSWindowButton, NSWindowCollectionBehavior, NSWindowOcclusionState,
-    NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
+    NSWindow as Objc2NSWindow, NSWindowButton as Objc2NSWindowButton, NSWindowCollectionBehavior,
+    NSWindowOcclusionState, NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{
     NSInteger, NSNotFound, NSOperatingSystemVersion, NSPoint as Objc2NSPoint, NSRange,
@@ -3867,7 +3867,15 @@ unsafe extern "C" fn blurred_view_init_with_frame(
         let view = msg_send![super(this, class!(NSVisualEffectView)), initWithFrame: frame];
         // Use a colorless semantic material. The default value `AppearanceBased`, though not
         // manually set, is deprecated.
-        let _: () = msg_send![view, setMaterial: NSVisualEffectMaterial::Selection];
+        //
+        // `UnderWindowBackground` rather than `Selection`: on macOS 26+, `Selection` no longer
+        // vends the `CABackdropLayer` that `remove_layer_background` walks, so the view renders
+        // with no blur at all. `UnderWindowBackground` still vends one, and is the material
+        // AppKit documents for the area behind a window's own background.
+        let _: () = msg_send![view, setMaterial: NSVisualEffectMaterial::UnderWindowBackground];
+        // Behind-window blending samples the desktop rather than the window's own content. It
+        // is already the default, but this view exists only for that mode.
+        let _: () = msg_send![view, setBlendingMode: NSVisualEffectBlendingMode::BehindWindow];
         let _: () = msg_send![view, setState: NSVisualEffectState::Active];
         view
     }
