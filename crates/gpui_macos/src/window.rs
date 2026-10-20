@@ -1520,6 +1520,38 @@ impl MacWindow {
         }
     }
 
+    /// Restarts the display links of all GPUI windows.
+    ///
+    /// CoreVideo can stop display links across system sleep, display sleep, or a
+    /// fast user switch, without AppKit reporting a screen or occlusion change
+    /// for the windows using them. Windows on the same display share one link,
+    /// so every window unsubscribes first: that stops the shared link, and the
+    /// first window to resubscribe starts it again. Paused windows are restarted
+    /// too and pause again after their next frame.
+    pub(crate) fn restart_frame_sources() {
+        let windows = unsafe {
+            let app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
+            let native_windows: ObjcId = msg_send![app, windows];
+            let count: NSUInteger = msg_send![native_windows, count];
+            let mut windows = Vec::new();
+            for i in 0..count {
+                let window: ObjcId = msg_send![native_windows, objectAtIndex: i];
+                if is_gpui_window(window)
+                    && let Some(state) = initialized_window_state(&*window)
+                {
+                    windows.push(state);
+                }
+            }
+            windows
+        };
+        for window in &windows {
+            window.lock().stop_display_link();
+        }
+        for window in &windows {
+            window.lock().resume_display_link();
+        }
+    }
+
     pub fn get_user_tabbing_preference() -> Option<UserTabbingPreference> {
         unsafe {
             let defaults: ObjcId = msg_send![class!(NSUserDefaults), standardUserDefaults];
