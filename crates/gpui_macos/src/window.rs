@@ -2139,6 +2139,10 @@ impl PlatformWindow for MacWindow {
         // A failed presentation asked for a forced re-render; keep ticking to deliver it.
         if !state.force_render_pending {
             state.stop_display_link();
+            // An idle window no longer renders the frames that would release
+            // render targets it stopped using.
+            #[cfg(not(feature = "wgpu"))]
+            state.renderer.release_idle_resources();
         }
     }
 

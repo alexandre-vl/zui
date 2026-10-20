@@ -54,6 +54,11 @@ const PRIMARY_TEXTURE_SLOT: u64 = 0;
 const SECONDARY_TEXTURE_SLOT: u64 = 1;
 const SAMPLER_SLOT: u64 = 0;
 
+/// Consecutive frames that must go by without needing an intermediate render target
+/// before it is released. Long enough that a target needed every few frames, or
+/// again shortly after, is not reallocated each time.
+const INTERMEDIATE_RELEASE_AFTER_FRAMES: u32 = 60;
+
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;
 
@@ -231,6 +236,56 @@ impl InstanceBufferPool {
     }
 }
 
+/// Recent demand for each kind of intermediate render target.
+#[derive(Default)]
+struct IntermediateUsage {
+    path: TargetUsage,
+    scene_color: TargetUsage,
+    blur: TargetUsage,
+    backdrop_snapshot: TargetUsage,
+    groups: TargetUsage,
+}
+
+/// Tracks how many targets of one kind recent frames needed, so that targets frames
+/// stopped needing can be released without reallocating ones needed intermittently.
+#[derive(Default)]
+struct TargetUsage {
+    /// Targets needed by the most recent frame.
+    last_needed: usize,
+    /// Most targets needed by a frame since demand dropped below the held count.
+    peak_needed: usize,
+    /// Consecutive frames that needed fewer targets than were held.
+    frames_below_held: u32,
+}
+
+impl TargetUsage {
+    /// Records a frame that needs `needed` targets while `held` are allocated, and
+    /// returns how many of the held targets to keep.
+    fn note_frame(&mut self, needed: usize, held: usize) -> usize {
+        self.last_needed = needed;
+        if needed >= held {
+            self.peak_needed = 0;
+            self.frames_below_held = 0;
+            return held;
+        }
+        self.peak_needed = self.peak_needed.max(needed);
+        self.frames_below_held += 1;
+        if self.frames_below_held < INTERMEDIATE_RELEASE_AFTER_FRAMES {
+            return held;
+        }
+        self.frames_below_held = 0;
+        mem::take(&mut self.peak_needed)
+    }
+
+    /// Returns how many targets to keep when no further frames are expected for a
+    /// while: those the most recent frame needed.
+    fn release_idle(&mut self) -> usize {
+        self.peak_needed = 0;
+        self.frames_below_held = 0;
+        self.last_needed
+    }
+}
+
 pub struct MetalRenderer {
     device: metal::Device,
     layer: Option<metal::MetalLayer>,
@@ -275,6 +330,7 @@ pub struct MetalRenderer {
     /// being filtered and composited back. Targets are pooled by active nesting depth.
     group_textures: Vec<metal::Texture>,
     intermediate_texture_size: Option<Size<DevicePixels>>,
+    intermediate_usage: IntermediateUsage,
     path_sample_count: u32,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
@@ -524,6 +580,7 @@ impl MetalRenderer {
             blur_pong_texture: None,
             group_textures: Vec::new(),
             intermediate_texture_size: None,
+            intermediate_usage: IntermediateUsage::default(),
             path_sample_count: PATH_SAMPLE_COUNT,
             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             headless_render_target: None,
@@ -582,6 +639,47 @@ impl MetalRenderer {
         let full_w = size.width.0 as u64;
         let full_h = size.height.0 as u64;
 
+        // Release targets that recent frames stopped needing. Command buffers still
+        // in flight retain the textures they reference.
+        let usage = &mut self.intermediate_usage;
+        if usage.path.note_frame(
+            usize::from(requirements.uses_path_target),
+            usize::from(self.path_intermediate_texture.is_some()),
+        ) == 0
+        {
+            self.path_intermediate_texture = None;
+            self.path_intermediate_msaa_texture = None;
+        }
+        if usage.scene_color.note_frame(
+            usize::from(requirements.uses_offscreen_target),
+            usize::from(self.scene_color_texture.is_some()),
+        ) == 0
+        {
+            self.scene_color_texture = None;
+        }
+        if usage.blur.note_frame(
+            usize::from(requirements.uses_blur_target),
+            usize::from(self.blur_ping_texture.is_some()),
+        ) == 0
+        {
+            self.blur_ping_texture = None;
+            self.blur_pong_texture = None;
+        }
+        let uses_backdrop_snapshot =
+            requirements.backdrop_filter_count > 0 && requirements.isolated_target_count > 0;
+        if usage.backdrop_snapshot.note_frame(
+            usize::from(uses_backdrop_snapshot),
+            usize::from(self.backdrop_snapshot_texture.is_some()),
+        ) == 0
+        {
+            self.backdrop_snapshot_texture = None;
+        }
+        let groups_to_keep = usage.groups.note_frame(
+            requirements.isolated_target_count,
+            self.group_textures.len(),
+        );
+        self.group_textures.truncate(groups_to_keep);
+
         let make_color_texture = |width: u64, height: u64| {
             let descriptor = metal::TextureDescriptor::new();
             descriptor.set_width(width.max(1));
@@ -637,7 +735,7 @@ impl MetalRenderer {
                 .get_or_insert_with(|| make_color_texture(blur_width, blur_height));
         }
 
-        if requirements.backdrop_filter_count > 0 && requirements.isolated_target_count > 0 {
+        if uses_backdrop_snapshot {
             self.backdrop_snapshot_texture
                 .get_or_insert_with(|| make_color_texture(full_w, full_h));
         }
@@ -645,6 +743,29 @@ impl MetalRenderer {
         while self.group_textures.len() < requirements.isolated_target_count {
             self.group_textures.push(make_color_texture(full_w, full_h));
         }
+    }
+
+    /// Releases the intermediate render targets that the most recent frame did not
+    /// use. Unused targets are otherwise only released after a run of frames that
+    /// don't need them, so call this when the window stops rendering frames.
+    pub fn release_idle_resources(&mut self) {
+        let usage = &mut self.intermediate_usage;
+        if usage.path.release_idle() == 0 {
+            self.path_intermediate_texture = None;
+            self.path_intermediate_msaa_texture = None;
+        }
+        if usage.scene_color.release_idle() == 0 {
+            self.scene_color_texture = None;
+        }
+        if usage.blur.release_idle() == 0 {
+            self.blur_ping_texture = None;
+            self.blur_pong_texture = None;
+        }
+        if usage.backdrop_snapshot.release_idle() == 0 {
+            self.backdrop_snapshot_texture = None;
+        }
+        let groups_to_keep = usage.groups.release_idle();
+        self.group_textures.truncate(groups_to_keep);
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
@@ -2246,6 +2367,70 @@ mod tests {
         assert!(renderer.blur_ping_texture.is_some());
         assert!(renderer.blur_pong_texture.is_some());
         assert!(renderer.group_textures.is_empty());
+
+        // Targets survive a run of frames that don't need them, up to a limit.
+        for _ in 1..INTERMEDIATE_RELEASE_AFTER_FRAMES {
+            renderer.prepare_intermediate_textures(&empty_scene, target_size);
+        }
+        assert!(renderer.scene_color_texture.is_some());
+        assert!(renderer.blur_ping_texture.is_some());
+        renderer.prepare_intermediate_textures(&empty_scene, target_size);
+        assert!(renderer.scene_color_texture.is_none());
+        assert!(renderer.blur_ping_texture.is_none());
+        assert!(renderer.blur_pong_texture.is_none());
+
+        // Once a window stops rendering, it keeps only what its last frame used.
+        renderer.prepare_intermediate_textures(&filtered_scene, target_size);
+        renderer.release_idle_resources();
+        assert!(renderer.scene_color_texture.is_some());
+        assert!(renderer.blur_ping_texture.is_some());
+        renderer.prepare_intermediate_textures(&empty_scene, target_size);
+        renderer.release_idle_resources();
+        assert!(renderer.scene_color_texture.is_none());
+        assert!(renderer.blur_ping_texture.is_none());
+        assert!(renderer.blur_pong_texture.is_none());
+    }
+
+    #[test]
+    fn target_usage_releases_targets_after_a_run_of_frames_not_needing_them() {
+        let mut usage = TargetUsage::default();
+        assert_eq!(usage.note_frame(3, 0), 0, "nothing is held yet");
+        assert_eq!(usage.note_frame(3, 3), 3);
+
+        // Demand drops to one target, with a brief spike to two.
+        for frame in 1..INTERMEDIATE_RELEASE_AFTER_FRAMES {
+            let needed = if frame == 10 { 2 } else { 1 };
+            assert_eq!(usage.note_frame(needed, 3), 3);
+        }
+        assert_eq!(
+            usage.note_frame(1, 3),
+            2,
+            "keeps as many targets as any frame in the run needed"
+        );
+
+        // A frame that needs every held target restarts the run.
+        for _ in 1..INTERMEDIATE_RELEASE_AFTER_FRAMES {
+            assert_eq!(usage.note_frame(0, 2), 2);
+        }
+        assert_eq!(usage.note_frame(2, 2), 2);
+        for _ in 1..INTERMEDIATE_RELEASE_AFTER_FRAMES {
+            assert_eq!(usage.note_frame(0, 2), 2);
+        }
+        assert_eq!(usage.note_frame(0, 2), 0);
+    }
+
+    #[test]
+    fn target_usage_keeps_what_the_last_frame_needed_when_idle() {
+        let mut usage = TargetUsage::default();
+        usage.note_frame(2, 2);
+        assert_eq!(usage.release_idle(), 2);
+        usage.note_frame(1, 2);
+        assert_eq!(usage.release_idle(), 1);
+        // Releasing restarts the run of frames counted toward a release.
+        for _ in 1..INTERMEDIATE_RELEASE_AFTER_FRAMES {
+            assert_eq!(usage.note_frame(0, 1), 1);
+        }
+        assert_eq!(usage.note_frame(0, 1), 0);
     }
 
     #[test]
