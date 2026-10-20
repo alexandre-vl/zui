@@ -553,6 +553,7 @@ fn content_mask_fades_quad_edges() {
                 bottom: ScaledPixels(0.0),
                 left: ScaledPixels(20.0),
             },
+            ..Default::default()
         },
         background: solid_background(red),
         ..Default::default()
@@ -579,4 +580,46 @@ fn content_mask_fades_quad_edges() {
     close(60, 2, 64);
     // The unfaded right edge still clips hard at the mask boundary.
     assert_eq!(pixel(101, 50)[0], 0);
+}
+
+#[test]
+fn nested_clip_keeps_the_outer_edge_fade() {
+    let mut renderer = WgpuHeadlessRenderer::new().expect("headless renderer");
+    let pixel_mask = |x: f32, width: f32, fade_left: f32| ContentMask {
+        bounds: gpui::Bounds::new(
+            gpui::point(gpui::px(x), gpui::px(0.0)),
+            gpui::size(gpui::px(width), gpui::px(100.0)),
+        ),
+        fade_out: Edges {
+            left: gpui::px(fade_left),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    // An overflow-hidden child that starts 10px into its parent's 20px fade band.
+    let parent = pixel_mask(0.0, 100.0, 20.0);
+    let child = pixel_mask(10.0, 50.0, 0.0);
+    let content_mask = child.intersect(&parent).scale(1.0);
+
+    let mut scene = Scene::default();
+    let red: Hsla = gpui::rgb_to_hsla(gpui::rgb(0xff0000));
+    scene.insert_primitive(Quad {
+        bounds: bounds(0.0, 0.0, 310.0, 100.0),
+        content_mask,
+        background: solid_background(red),
+        ..Default::default()
+    });
+    scene.finish();
+    let image = renderer
+        .render_scene_to_image(&scene, TARGET)
+        .expect("render must succeed");
+    let red_at = |x: u32| image.get_pixel(x, 50).0[0];
+
+    // Clipped hard by the child.
+    assert_eq!(red_at(9), 0);
+    // The parent's ramp continues: 10.5px into the 20px band is 52.5% coverage.
+    assert!(red_at(10).abs_diff(134) <= 3, "got {}", red_at(10));
+    assert!(red_at(15).abs_diff(198) <= 3, "got {}", red_at(15));
+    assert_eq!(red_at(30), 255);
+    assert_eq!(red_at(60), 0);
 }

@@ -929,7 +929,11 @@ impl Style {
                     fade_out.bottom = Pixels::ZERO;
                 }
 
-                Some(ContentMask { bounds, fade_out })
+                Some(ContentMask {
+                    bounds,
+                    fade_out,
+                    ..Default::default()
+                })
             }
         }
     }

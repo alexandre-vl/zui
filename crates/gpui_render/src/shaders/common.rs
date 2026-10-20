@@ -144,26 +144,33 @@ mod source {
     pub struct ContentMask {
         pub bounds: Bounds,
         pub fade_out: Edges,
+        pub fade_outset: Edges,
     }
 
     impl ContentMask {
         /// The mask's coverage at the given window-space position: 1 inside,
-        /// 0 outside, and a linear ramp to 0 across each edge's fade distance.
+        /// 0 outside, and a linear ramp across each edge's fade distance. Each
+        /// ramp starts `fade_outset` outside its clip edge.
         pub fn alpha(content_mask: ContentMask, position: Vec2f) -> f32 {
             let bounds = content_mask.bounds;
             let fade = content_mask.fade_out;
+            let outset = content_mask.fade_outset;
             let mut alpha = 1.0;
             if fade.left > 0.0 {
-                alpha *= saturate((position.x - bounds.origin.x) / fade.left);
+                alpha *= saturate((position.x - bounds.origin.x + outset.left) / fade.left);
             }
             if fade.right > 0.0 {
-                alpha *= saturate((bounds.origin.x + bounds.size.x - position.x) / fade.right);
+                alpha *= saturate(
+                    (bounds.origin.x + bounds.size.x + outset.right - position.x) / fade.right,
+                );
             }
             if fade.top > 0.0 {
-                alpha *= saturate((position.y - bounds.origin.y) / fade.top);
+                alpha *= saturate((position.y - bounds.origin.y + outset.top) / fade.top);
             }
             if fade.bottom > 0.0 {
-                alpha *= saturate((bounds.origin.y + bounds.size.y - position.y) / fade.bottom);
+                alpha *= saturate(
+                    (bounds.origin.y + bounds.size.y + outset.bottom - position.y) / fade.bottom,
+                );
             }
             alpha
         }

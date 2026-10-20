@@ -2186,6 +2186,57 @@ pub struct ContentMask<P: Clone + Debug + Default + PartialEq> {
     pub bounds: Bounds<P>,
     /// Edge fade distances. A zero distance leaves that edge fully opaque.
     pub fade_out: Edges<P>,
+    /// How far outside `bounds` each edge's fade ramp starts. Zero starts the ramp at the
+    /// clip edge. Intersecting masks sets this when a fade belongs to an outer mask whose
+    /// edge lies beyond the intersected bounds, so content clipped by a nested mask keeps
+    /// the outer ramp instead of losing it. Device-pixel snapping of `bounds` can make a
+    /// scaled outset slightly negative, which keeps the ramp at its unsnapped position.
+    pub fade_outset: Edges<P>,
+}
+
+/// One edge's fade ramp in inward-facing coordinates: opacity rises from 0 at `start` to
+/// 1 at `end`.
+#[derive(Clone, Copy)]
+struct FadeRamp {
+    start: f32,
+    end: f32,
+}
+
+impl FadeRamp {
+    fn new(clip_edge: f32, fade: f32, outset: f32) -> Option<Self> {
+        (fade > 0.).then(|| {
+            let start = clip_edge - outset;
+            Self {
+                start,
+                end: start + fade,
+            }
+        })
+    }
+
+    /// Combine the ramps of two nested masks at a shared edge whose clip lies at
+    /// `clip_edge`. A ramp that is fully opaque by the clip edge no longer affects anything
+    /// and is dropped. When both still matter, the exact result would be their product,
+    /// which is not a single ramp; the combined ramp starts where the later one starts, so
+    /// it is still transparent at the clip, and ends where the later one ends, so it is
+    /// opaque only where both are. Ramps sharing a start therefore keep the stronger fade.
+    fn intersect(a: Option<Self>, b: Option<Self>, clip_edge: f32) -> Option<Self> {
+        let a = a.filter(|ramp| ramp.end > clip_edge);
+        let b = b.filter(|ramp| ramp.end > clip_edge);
+        match (a, b) {
+            (Some(a), Some(b)) => Some(Self {
+                start: a.start.max(b.start),
+                end: a.end.max(b.end),
+            }),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Returns the `(fade_out, fade_outset)` pair for this ramp at `clip_edge`.
+    fn distances(ramp: Option<Self>, clip_edge: f32) -> (f32, f32) {
+        ramp.map_or((0., 0.), |ramp| {
+            (ramp.end - ramp.start, clip_edge - ramp.start)
+        })
+    }
 }
 
 impl ContentMask<Pixels> {
@@ -2194,61 +2245,57 @@ impl ContentMask<Pixels> {
         ContentMask {
             bounds: self.bounds.scale(factor),
             fade_out: self.fade_out.scale(factor),
+            fade_outset: self.fade_outset.scale(factor),
         }
     }
 
     /// Intersect the content mask with the given content mask.
     ///
-    /// For each edge, the mask that actually clips at that edge contributes its
-    /// fade; when both masks clip at the same coordinate, the stronger fade wins.
+    /// Each mask's edge fades keep their position in window space, so content inside an
+    /// outer mask's fade band stays faded when a nested mask clips it. When both masks fade
+    /// the same edge, the result is transparent at the clip edge and opaque only past both
+    /// ramps; ramps that share a start keep the stronger fade.
     pub fn intersect(&self, other: &Self) -> Self {
-        fn edge_fade(
-            a: Pixels,
-            b: Pixels,
-            a_fade: Pixels,
-            b_fade: Pixels,
-            a_clips_closer: impl Fn(Pixels, Pixels) -> bool,
-        ) -> Pixels {
-            if a_clips_closer(a, b) {
-                a_fade
-            } else if a_clips_closer(b, a) {
-                b_fade
-            } else {
-                a_fade.max(b_fade)
-            }
+        // Clip edges measured inward, in `Edges` order: top, right, bottom, left.
+        fn clip_edges(bounds: &Bounds<Pixels>) -> [f32; 4] {
+            [
+                bounds.top().0,
+                -bounds.right().0,
+                -bounds.bottom().0,
+                bounds.left().0,
+            ]
+        }
+        fn edge_values(edges: &Edges<Pixels>) -> [f32; 4] {
+            [edges.top.0, edges.right.0, edges.bottom.0, edges.left.0]
+        }
+        fn ramps(mask: &ContentMask<Pixels>) -> [Option<FadeRamp>; 4] {
+            let clips = clip_edges(&mask.bounds);
+            let fades = edge_values(&mask.fade_out);
+            let outsets = edge_values(&mask.fade_outset);
+            std::array::from_fn(|edge| FadeRamp::new(clips[edge], fades[edge], outsets[edge]))
         }
 
+        let bounds = self.bounds.intersect(&other.bounds);
+        let clips = clip_edges(&bounds);
+        let (self_ramps, other_ramps) = (ramps(self), ramps(other));
+        let [top, right, bottom, left] = std::array::from_fn(|edge| {
+            let ramp = FadeRamp::intersect(self_ramps[edge], other_ramps[edge], clips[edge]);
+            FadeRamp::distances(ramp, clips[edge])
+        });
+
         ContentMask {
-            bounds: self.bounds.intersect(&other.bounds),
+            bounds,
             fade_out: Edges {
-                top: edge_fade(
-                    self.bounds.top(),
-                    other.bounds.top(),
-                    self.fade_out.top,
-                    other.fade_out.top,
-                    |a, b| a > b,
-                ),
-                right: edge_fade(
-                    self.bounds.right(),
-                    other.bounds.right(),
-                    self.fade_out.right,
-                    other.fade_out.right,
-                    |a, b| a < b,
-                ),
-                bottom: edge_fade(
-                    self.bounds.bottom(),
-                    other.bounds.bottom(),
-                    self.fade_out.bottom,
-                    other.fade_out.bottom,
-                    |a, b| a < b,
-                ),
-                left: edge_fade(
-                    self.bounds.left(),
-                    other.bounds.left(),
-                    self.fade_out.left,
-                    other.fade_out.left,
-                    |a, b| a > b,
-                ),
+                top: px(top.0),
+                right: px(right.0),
+                bottom: px(bottom.0),
+                left: px(left.0),
+            },
+            fade_outset: Edges {
+                top: px(top.1),
+                right: px(right.1),
+                bottom: px(bottom.1),
+                left: px(left.1),
             },
         }
     }
@@ -2265,17 +2312,88 @@ mod content_mask_tests {
                 left: px(fade_left),
                 ..Default::default()
             },
+            ..Default::default()
         }
     }
 
     #[test]
-    fn intersect_keeps_only_the_fade_at_the_visible_edge() {
+    fn intersect_drops_fades_that_end_before_the_clip() {
         let outer = mask(0., 100., 20.);
         let inner = mask(30., 40., 0.);
-        assert_eq!(outer.intersect(&inner).fade_out.left, px(0.));
+        let intersection = outer.intersect(&inner);
+        assert_eq!(intersection.fade_out, Edges::default());
+        assert_eq!(intersection.fade_outset, Edges::default());
 
         let child = mask(0., 40., 0.);
         assert_eq!(outer.intersect(&child).fade_out.left, px(20.));
+        assert_eq!(outer.intersect(&child).fade_outset.left, px(0.));
+    }
+
+    #[test]
+    fn nested_clip_inside_a_fade_band_keeps_the_outer_ramp() {
+        let outer = mask(0., 100., 20.);
+        let inner = mask(10., 50., 0.);
+        for intersection in [outer.intersect(&inner), inner.intersect(&outer)] {
+            assert_eq!(intersection.bounds.left(), px(10.));
+            // The ramp still runs from x = 0 to x = 20.
+            assert_eq!(intersection.fade_out.left, px(20.));
+            assert_eq!(intersection.fade_outset.left, px(10.));
+        }
+
+        // Nesting again keeps the original ramp.
+        let innermost = mask(15., 10., 0.);
+        let nested = outer.intersect(&inner).intersect(&innermost);
+        assert_eq!(nested.fade_out.left, px(20.));
+        assert_eq!(nested.fade_outset.left, px(15.));
+    }
+
+    #[test]
+    fn inner_fade_survives_a_closer_outer_clip() {
+        let outer = mask(10., 100., 0.);
+        let inner = mask(0., 50., 20.);
+        let intersection = inner.intersect(&outer);
+        assert_eq!(intersection.bounds.left(), px(10.));
+        assert_eq!(intersection.fade_out.left, px(20.));
+        assert_eq!(intersection.fade_outset.left, px(10.));
+    }
+
+    #[test]
+    fn overlapping_fades_combine_into_one_ramp() {
+        // Shared edges keep the stronger fade.
+        let a = mask(0., 100., 20.);
+        let b = mask(0., 100., 8.);
+        assert_eq!(a.intersect(&b).fade_out.left, px(20.));
+        assert_eq!(b.intersect(&a).fade_out.left, px(20.));
+
+        // Staggered ramps run from the later start to the later end.
+        let outer = mask(0., 100., 20.);
+        let inner = mask(10., 100., 5.);
+        let intersection = outer.intersect(&inner);
+        assert_eq!(intersection.fade_out.left, px(10.));
+        assert_eq!(intersection.fade_outset.left, px(0.));
+    }
+
+    #[test]
+    fn far_edges_are_measured_inward() {
+        let outer = ContentMask {
+            bounds: Bounds::new(point(px(0.), px(0.)), size(px(100.), px(100.))),
+            fade_out: Edges {
+                right: px(20.),
+                bottom: px(20.),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let inner = ContentMask {
+            bounds: Bounds::new(point(px(0.), px(0.)), size(px(90.), px(70.))),
+            ..Default::default()
+        };
+        let intersection = outer.intersect(&inner);
+        assert_eq!(intersection.fade_out.right, px(20.));
+        assert_eq!(intersection.fade_outset.right, px(10.));
+        // The bottom ramp ends at y = 80, past the inner clip at y = 70.
+        assert_eq!(intersection.fade_out.bottom, Pixels::ZERO);
+        assert_eq!(intersection.fade_outset.bottom, Pixels::ZERO);
     }
 }
 
@@ -3137,9 +3255,49 @@ impl Window {
     #[inline]
     fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
         let mask = self.content_mask();
+        let scale_factor = self.scale_factor();
+        let bounds = self.cover_bounds(mask.bounds);
+        // Snapping only widens the hard clip; fade ramps keep their layout position so
+        // nested masks continue each other's ramps exactly. `outward` is the direction
+        // pointing out of the mask along the edge's axis.
+        let outset = |fade: Pixels, snapped_edge: ScaledPixels, ramp_start: Pixels, outward| {
+            if fade > Pixels::ZERO {
+                ScaledPixels((ramp_start.0 * scale_factor - snapped_edge.0) * outward)
+            } else {
+                ScaledPixels(0.)
+            }
+        };
+        let fade = mask.fade_out;
+        let fade_outset = mask.fade_outset;
         ContentMask {
-            bounds: self.cover_bounds(mask.bounds),
-            fade_out: mask.fade_out.scale(self.scale_factor()),
+            bounds,
+            fade_out: fade.scale(scale_factor),
+            fade_outset: Edges {
+                top: outset(
+                    fade.top,
+                    bounds.top(),
+                    mask.bounds.top() - fade_outset.top,
+                    -1.,
+                ),
+                right: outset(
+                    fade.right,
+                    bounds.right(),
+                    mask.bounds.right() + fade_outset.right,
+                    1.,
+                ),
+                bottom: outset(
+                    fade.bottom,
+                    bounds.bottom(),
+                    mask.bounds.bottom() + fade_outset.bottom,
+                    1.,
+                ),
+                left: outset(
+                    fade.left,
+                    bounds.left(),
+                    mask.bounds.left() - fade_outset.left,
+                    -1.,
+                ),
+            },
         }
     }
 
@@ -4161,7 +4319,7 @@ impl Window {
             bounds,
             content_mask: ContentMask {
                 bounds,
-                fade_out: Edges::default(),
+                ..Default::default()
             },
             corner_radii: Corners::default(),
             corner_smoothing: 0.0,
