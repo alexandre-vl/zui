@@ -579,7 +579,10 @@ impl ListState {
 
         let start_pixel_offset = cursor.start().height + current_offset.offset_in_item;
         let new_pixel_offset = (start_pixel_offset + distance).max(px(0.));
-        if new_pixel_offset > start_pixel_offset {
+        // `scroll_to` can anchor an item below the viewport top with a negative
+        // `offset_in_item`, so even a positive distance may land before the
+        // cursor's position. Compare against the cursor before seeking forward.
+        if new_pixel_offset >= cursor.start().height {
             cursor.seek_forward(&Height(new_pixel_offset), Bias::Right);
         } else {
             cursor.seek(&Height(new_pixel_offset), Bias::Right);
@@ -1951,6 +1954,37 @@ mod test {
         let offset = state.logical_scroll_top();
         assert_eq!(offset.item_ix, 0);
         assert_eq!(offset.offset_in_item, px(0.));
+    }
+
+    #[gpui::test]
+    fn test_scroll_by_from_negative_item_offset(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let state = ListState::new(5, crate::ListAlignment::Top, px(10.)).measure_all();
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
+            cx.new(|_| TestListView(state.clone())).into_any_element()
+        });
+
+        // Anchor item 2 ten pixels below the viewport top. Small positive
+        // distances then still land before item 2's start.
+        for (distance, item_ix, offset) in [
+            (1., 1, 11.),
+            (9., 1, 19.),
+            (10., 2, 0.),
+            (11., 2, 1.),
+            (-1., 1, 9.),
+        ] {
+            state.scroll_to(gpui::ListOffset {
+                item_ix: 2,
+                offset_in_item: px(-10.),
+            });
+            state.scroll_by(px(distance));
+            let actual = state.logical_scroll_top();
+            assert_eq!(
+                (actual.item_ix, actual.offset_in_item),
+                (item_ix, px(offset)),
+                "scroll_by({distance})"
+            );
+        }
     }
 
     struct TestListView(ListState);
