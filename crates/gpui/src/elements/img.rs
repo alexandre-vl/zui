@@ -347,7 +347,13 @@ impl Element for Img {
 
                             let image_size = data.render_size(frame_index);
 
-                            if style.aspect_ratio.is_none() {
+                            // Like CSS, the intrinsic ratio only applies when a dimension is
+                            // auto. Applied over explicit dimensions, it lets layout size the
+                            // image past them.
+                            if style.aspect_ratio.is_none()
+                                && (style.size.width == Length::Auto
+                                    || style.size.height == Length::Auto)
+                            {
                                 style.aspect_ratio = Some(image_size.width / image_size.height);
                             }
 
@@ -896,6 +902,57 @@ mod tests {
                 .update(|_, cx| cx.peek_asset::<AssetLogger<ImageDecoder>>(&data))
                 .is_none()
         );
+    }
+
+    #[gpui::test]
+    fn intrinsic_aspect_ratio_does_not_override_explicit_dimensions(cx: &mut TestAppContext) {
+        let window = cx.add_empty_window();
+        let layouts: [(&str, fn() -> AnyElement); 2] = [
+            ("full width, fixed height", || {
+                div()
+                    .w(px(100.))
+                    .child(
+                        img(ImageSource::Render(test_image_with_size(100, 400)))
+                            .w_full()
+                            .h(px(60.))
+                            .object_fit(ObjectFit::Cover),
+                    )
+                    .into_any_element()
+            }),
+            ("full size in a stretched flex item", || {
+                div()
+                    .flex()
+                    .h(px(60.))
+                    .child(
+                        div().w(px(100.)).child(
+                            img(ImageSource::Render(test_image_with_size(100, 400)))
+                                .size_full()
+                                .object_fit(ObjectFit::Cover),
+                        ),
+                    )
+                    .into_any_element()
+            }),
+        ];
+
+        for (layout, build) in layouts {
+            window.draw(point(px(0.), px(0.)), size(px(300.), px(300.)), |_, _| {
+                build()
+            });
+            let (rendered_size, scale_factor) = window.update(|window, _| {
+                let sprite = window
+                    .rendered_frame
+                    .scene
+                    .polychrome_sprites
+                    .last()
+                    .expect("image should paint a sprite");
+                (sprite.bounds.size, window.scale_factor())
+            });
+            assert_eq!(
+                rendered_size,
+                size(px(100.).scale(scale_factor), px(60.).scale(scale_factor)),
+                "{layout}"
+            );
+        }
     }
 
     #[gpui::test]
