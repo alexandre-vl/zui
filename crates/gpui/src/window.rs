@@ -1138,6 +1138,10 @@ pub(crate) struct Frame {
     pointer_observers: Rc<Vec<PointerObserver>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
+    /// Index of the first scene operation that composites above native child surfaces.
+    overlay_scene_start: usize,
+    /// Whether the overlay content is interactive and should receive pointer input.
+    overlay_captures_input: bool,
     presentation_callbacks: Vec<Rc<dyn Fn()>>,
     pub(crate) hitboxes: Vec<Hitbox>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
@@ -1188,6 +1192,8 @@ impl Frame {
             pointer_observers: Rc::default(),
             dispatch_tree,
             scene: Scene::default(),
+            overlay_scene_start: 0,
+            overlay_captures_input: false,
             presentation_callbacks: Vec::new(),
             hitboxes: Vec::new(),
             window_control_hitboxes: Vec::new(),
@@ -1215,6 +1221,8 @@ impl Frame {
         Rc::make_mut(&mut self.pointer_observers).clear();
         self.dispatch_tree.clear();
         self.scene.clear();
+        self.overlay_scene_start = 0;
+        self.overlay_captures_input = false;
         self.presentation_callbacks.clear();
         self.input_handlers.clear();
         self.tooltip_requests.clear();
@@ -3401,6 +3409,28 @@ impl Window {
         self.invalidator.replace_views(views);
     }
 
+    /// Lets native child surfaces composite between GPUI's content and its overlays.
+    ///
+    /// Once enabled, the window is drawn as two planes. The base plane holds the root view's
+    /// paint. The overlay plane holds everything painted above it: deferred draws (menus and
+    /// popovers), prompts, drag previews, tooltips and the inspector. Native children mounted
+    /// through [`Self::native_composition`] sit between the two, so GPUI menus can open over an
+    /// embedded web view. While deferred draws, a prompt or a drag preview are visible, the
+    /// platform routes pointer input to GPUI instead of the native children; passive tooltips do
+    /// not take input away from them.
+    ///
+    /// Supported on macOS with the Metal renderer and on Windows with DirectComposition; other
+    /// configurations return an error. Calling this again once it has succeeded is a no-op.
+    pub fn enable_scene_overlay(&self) -> anyhow::Result<()> {
+        self.platform_window.enable_scene_overlay()
+    }
+
+    /// Where native child surfaces mount, beneath GPUI's overlay plane, once
+    /// [`Self::enable_scene_overlay`] has succeeded.
+    pub fn native_composition(&self) -> Option<crate::NativeComposition> {
+        self.platform_window.native_composition()
+    }
+
     /// Registers a callback that runs when the frame being painted is presented,
     /// immediately before its scene is handed to the platform for drawing.
     ///
@@ -3433,7 +3463,11 @@ impl Window {
         for callback in &self.rendered_frame.presentation_callbacks {
             callback();
         }
-        self.platform_window.draw(&self.rendered_frame.scene);
+        self.platform_window.draw_layered(
+            &self.rendered_frame.scene,
+            self.rendered_frame.overlay_scene_start,
+            self.rendered_frame.overlay_captures_input,
+        );
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
             present_start,
@@ -3569,6 +3603,20 @@ impl Window {
         // Now actually paint the elements.
         self.invalidator.set_phase(DrawPhase::Paint);
         root_element.paint(self, cx);
+
+        // Everything painted from here on (inspector, deferred draws, prompt, drag preview,
+        // tooltip) composites above native child surfaces when the platform supports a scene
+        // overlay. This plane split is adapted from the Apache-2.0 GPUI fork at
+        // https://github.com/egoist/zed (57bd4fe). Interactive overlay content takes pointer
+        // input from those surfaces; a passive tooltip must not, merely because it is visible.
+        debug_assert!(
+            !self.next_frame.scene.is_in_filter_group(),
+            "root paint left a filter group open"
+        );
+        self.next_frame.overlay_scene_start = self.next_frame.scene.len();
+        self.next_frame.overlay_captures_input = !self.next_frame.deferred_draws.is_empty()
+            || prompt_element.is_some()
+            || active_drag_element.is_some();
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector(inspector_element, cx);
@@ -9840,6 +9888,56 @@ mod tests {
             );
         })
         .unwrap();
+    }
+
+    struct OverlaySplitView {
+        menu_open: bool,
+    }
+
+    impl Render for OverlaySplitView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .bg(crate::red())
+                .child(div().size(px(10.)).bg(crate::green()))
+                .when(self.menu_open, |root| {
+                    root.child(crate::deferred(
+                        div().size(px(20.)).bg(crate::blue()).opacity(0.5),
+                    ))
+                })
+        }
+    }
+
+    #[test]
+    fn deferred_draws_start_an_input_capturing_overlay() {
+        let mut app = TestApp::new();
+        let mut test_window = app.open_window(|_, _| OverlaySplitView { menu_open: false });
+        test_window.draw();
+        test_window.update(|_, window, _| {
+            let frame = &window.rendered_frame;
+            assert_eq!(frame.overlay_scene_start, frame.scene.len());
+            assert!(!frame.overlay_captures_input);
+        });
+
+        test_window.update(|view, _, cx| {
+            view.menu_open = true;
+            cx.notify();
+        });
+        test_window.draw();
+        test_window.update(|_, window, _| {
+            let frame = &window.rendered_frame;
+            assert!(frame.overlay_scene_start < frame.scene.len());
+            assert!(frame.overlay_captures_input);
+
+            let (base, overlay) = frame.scene.split_at(frame.overlay_scene_start);
+            assert_eq!(base.quads.len(), 2, "root content stays in the base plane");
+            assert_eq!(
+                overlay.quads.len(),
+                1,
+                "deferred content moves to the overlay"
+            );
+            assert_eq!(overlay.filter_boundaries.len(), 2);
+        });
     }
 
     struct CachedPresentParent {
