@@ -600,6 +600,8 @@ unsafe fn build_classes() {
             decl.add_method(sel!(isFlipped), yes as unsafe extern "C" fn(_, _) -> _);
             decl.register() as *const AnyClass
         };
+        #[cfg(not(feature = "wgpu"))]
+        crate::native_backdrop::register_view_class();
     }
 }
 
@@ -953,6 +955,7 @@ struct MacWindowState {
 /// ```text
 /// GPUIView (base plane)
 /// ├── GPUINativeContentView (application-owned native children)
+/// ├── GPUIBackdropView… (native blurs beneath overlay backdrop filters)
 /// └── GPUIOverlayView (overlay plane)
 /// ```
 #[cfg(not(feature = "wgpu"))]
@@ -964,6 +967,8 @@ struct SceneOverlay {
     native_host: NonNull<Objc2Object>,
     /// Shared with `view`'s hit testing.
     captures_input: Arc<AtomicBool>,
+    /// Native blurs of the content beneath the overlay's backdrop filters.
+    backdrops: crate::native_backdrop::NativeBackdrops,
     visible: bool,
     drawable_size: Size<gpui::DevicePixels>,
     scale_factor: f32,
@@ -2419,7 +2424,10 @@ impl PlatformWindow for MacWindow {
         }
 
         let scale_factor = state.scale_factor();
-        let drawable_size = state.content_size().to_device_pixels(scale_factor);
+        let content_size = state.content_size();
+        let drawable_size = content_size.to_device_pixels(scale_factor);
+        let view_height = f64::from(f32::from(content_size.height));
+        let native_view_ptr = state.native_view.as_ptr();
         let overlay_scene = if overlay_start < scene.len() {
             let (base, overlay) = scene.split_at(overlay_start);
             state.renderer.draw(&base);
@@ -2435,6 +2443,18 @@ impl PlatformWindow for MacWindow {
             .captures_input
             .swap(captures_input, Ordering::AcqRel)
             && captures_input;
+        let backdrop_filters = overlay_scene
+            .as_ref()
+            .map_or(&[][..], |overlay_scene| &overlay_scene.backdrop_filters[..]);
+        unsafe {
+            overlay.backdrops.sync(
+                native_view_ptr,
+                overlay.view.as_ptr(),
+                backdrop_filters,
+                view_height,
+                scale_factor,
+            );
+        }
         if let Some(overlay_scene) = &overlay_scene {
             overlay.update_drawable_size(drawable_size, scale_factor);
             overlay.renderer.draw(overlay_scene);
@@ -2508,6 +2528,7 @@ impl PlatformWindow for MacWindow {
                 view: NonNull::new_unchecked(view),
                 native_host: NonNull::new_unchecked(native_host),
                 captures_input,
+                backdrops: Default::default(),
                 visible: false,
                 drawable_size: Size::default(),
                 scale_factor: 0.,
