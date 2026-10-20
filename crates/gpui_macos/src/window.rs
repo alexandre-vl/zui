@@ -820,6 +820,9 @@ struct MacWindowState {
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
     frame_source: Option<WindowFrameSource>,
+    /// Whether the frame source is delivering frames, or a restart has been queued.
+    /// Shared with the frame waker, which must not lock this state.
+    frame_requests_active: Arc<AtomicBool>,
     renderer: renderer::Renderer,
     /// Forces an uncached scene after GPU recovery or a transient presentation failure.
     force_render_pending: bool,
@@ -1005,13 +1008,29 @@ impl MacWindowState {
             return;
         };
         let data = self.native_view.as_ptr() as *mut c_void;
-        self.frame_source
+        let started = self
+            .frame_source
             .get_or_insert_with(|| WindowFrameSource::new(data, step))
             .start(display_id)
-            .log_err();
+            .log_err()
+            .is_some();
+        self.frame_requests_active.store(started, Ordering::Release);
+    }
+
+    /// Restarts a display link that was stopped while the window was idle. A window
+    /// whose frame source was never started (it has not been shown yet) or was
+    /// dropped along with its `MacWindow` is left alone; AppKit's occlusion and
+    /// screen notifications start display links for windows coming on screen.
+    fn resume_display_link(&mut self) {
+        match &self.frame_source {
+            Some(frame_source) if frame_source.is_running() => {}
+            Some(_) if !self.closed.load(Ordering::Acquire) => self.start_display_link(),
+            _ => self.frame_requests_active.store(false, Ordering::Release),
+        }
     }
 
     fn stop_display_link(&mut self) {
+        self.frame_requests_active.store(false, Ordering::Release);
         if let Some(frame_source) = self.frame_source.as_mut() {
             frame_source.stop();
         }
@@ -1261,6 +1280,7 @@ impl MacWindow {
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
                 frame_source: None,
+                frame_requests_active: Arc::new(AtomicBool::new(false)),
                 renderer,
                 force_render_pending: false,
                 request_frame_callback: None,
@@ -2052,6 +2072,42 @@ impl PlatformWindow for MacWindow {
         let window = this.native_window;
 
         unsafe { window.styleMask().contains(NSWindowStyleMask::FullScreen) }
+    }
+
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        let state = self.0.lock();
+        let active = state.frame_requests_active.clone();
+        let executor = state.foreground_executor.clone();
+        let window = Arc::downgrade(&self.0);
+        Some(Rc::new(move || {
+            if active.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            // Wakes run synchronously inside GPUI invalidation, possibly from
+            // within a platform callback for this window. Restart the display
+            // link on a later main-queue turn so that never re-enters its state.
+            let window = window.clone();
+            executor
+                .spawn(async move {
+                    let Some(window) = window.upgrade() else {
+                        return;
+                    };
+                    let mut state = window.lock();
+                    // Skip the restart if the window paused again meanwhile.
+                    if state.frame_requests_active.load(Ordering::Acquire) {
+                        state.resume_display_link();
+                    }
+                })
+                .detach();
+        }))
+    }
+
+    fn pause_frame_requests(&self) {
+        let mut state = self.0.lock();
+        // A failed presentation asked for a forced re-render; keep ticking to deliver it.
+        if !state.force_render_pending {
+            state.stop_display_link();
+        }
     }
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {

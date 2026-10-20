@@ -1880,6 +1880,12 @@ impl Window {
                             || !window.next_frame_callbacks.borrow().is_empty()
                         {
                             window.platform_window.schedule_frame();
+                        } else if !window.needs_present.get()
+                            && !window.input_rate_tracker.borrow().is_high_rate()
+                        {
+                            // Nothing will change until new demand wakes the
+                            // platform, so let it stop ticking.
+                            window.platform_window.pause_frame_requests();
                         }
                     })
                     .log_err();
@@ -8765,6 +8771,61 @@ mod tests {
             test_window.frame_wake_count() > baseline || callback_ran.get(),
             "a frame request with pending next-frame callbacks must either run them or re-arm the frame source"
         );
+    }
+
+    /// Platforms with a continuously ticking display clock stop delivering
+    /// frames once a window pauses frame requests, so every source of frame
+    /// demand must resume them and an idle window must pause again.
+    #[gpui::test]
+    fn test_idle_window_pauses_and_resumes_frame_requests(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let mut test_window = cx.test_window(window.into());
+        // Keep the inactive-window frame-rate throttle out of the way.
+        window
+            .update(cx, |_, window, _| window.active.set(true))
+            .unwrap();
+
+        assert!(test_window.simulate_display_tick());
+        assert!(
+            !test_window.simulate_display_tick(),
+            "a clean window must pause frame requests"
+        );
+
+        window.update(cx, |_, _, cx| cx.notify()).unwrap();
+        assert!(
+            test_window.simulate_display_tick(),
+            "notifying a view must resume frame requests"
+        );
+        assert!(!test_window.simulate_display_tick());
+
+        fn animate(window: &Window, remaining: u32, frames: Rc<Cell<u32>>) {
+            window.on_next_frame(move |window, _| {
+                frames.set(frames.get() + 1);
+                window.refresh();
+                if remaining > 1 {
+                    animate(window, remaining - 1, frames);
+                }
+            });
+        }
+        let frames = Rc::new(Cell::new(0));
+        window
+            .update(cx, |_, window, _| animate(window, 3, frames.clone()))
+            .unwrap();
+        for _ in 0..3 {
+            assert!(test_window.simulate_display_tick());
+        }
+        assert_eq!(frames.get(), 3, "every animation frame must be delivered");
+        assert!(
+            !test_window.simulate_display_tick(),
+            "a finished animation must pause frame requests"
+        );
+
+        test_window.simulate_resize(size(px(720.), px(480.)));
+        assert!(
+            test_window.simulate_display_tick(),
+            "resizing must resume frame requests"
+        );
+        assert!(!test_window.simulate_display_tick());
     }
 
     #[gpui::test]

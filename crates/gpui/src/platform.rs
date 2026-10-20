@@ -936,6 +936,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
         None
     }
+    /// Called after a frame that left the window with no pending work: it is not
+    /// dirty, has no next-frame callbacks, and is not sustaining presentation for
+    /// high-rate input. Platforms whose frame source ticks continuously may stop
+    /// delivering `on_request_frame` callbacks until the closure returned by
+    /// [`Self::frame_waker`] is next invoked.
+    fn pause_frame_requests(&self) {}
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>);
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>);
     fn on_active_status_change(&self, callback: Box<dyn FnMut(bool)>);
