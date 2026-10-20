@@ -2248,58 +2248,70 @@ impl ContentMask<Pixels> {
             fade_outset: self.fade_outset.scale(factor),
         }
     }
-
-    /// Intersect the content mask with the given content mask.
-    ///
-    /// Each mask's edge fades keep their position in window space, so content inside an
-    /// outer mask's fade band stays faded when a nested mask clips it. When both masks fade
-    /// the same edge, the result is transparent at the clip edge and opaque only past both
-    /// ramps; ramps that share a start keep the stronger fade.
-    pub fn intersect(&self, other: &Self) -> Self {
-        // Clip edges measured inward, in `Edges` order: top, right, bottom, left.
-        fn clip_edges(bounds: &Bounds<Pixels>) -> [f32; 4] {
-            [
-                bounds.top().0,
-                -bounds.right().0,
-                -bounds.bottom().0,
-                bounds.left().0,
-            ]
-        }
-        fn edge_values(edges: &Edges<Pixels>) -> [f32; 4] {
-            [edges.top.0, edges.right.0, edges.bottom.0, edges.left.0]
-        }
-        fn ramps(mask: &ContentMask<Pixels>) -> [Option<FadeRamp>; 4] {
-            let clips = clip_edges(&mask.bounds);
-            let fades = edge_values(&mask.fade_out);
-            let outsets = edge_values(&mask.fade_outset);
-            std::array::from_fn(|edge| FadeRamp::new(clips[edge], fades[edge], outsets[edge]))
-        }
-
-        let bounds = self.bounds.intersect(&other.bounds);
-        let clips = clip_edges(&bounds);
-        let (self_ramps, other_ramps) = (ramps(self), ramps(other));
-        let [top, right, bottom, left] = std::array::from_fn(|edge| {
-            let ramp = FadeRamp::intersect(self_ramps[edge], other_ramps[edge], clips[edge]);
-            FadeRamp::distances(ramp, clips[edge])
-        });
-
-        ContentMask {
-            bounds,
-            fade_out: Edges {
-                top: px(top.0),
-                right: px(right.0),
-                bottom: px(bottom.0),
-                left: px(left.0),
-            },
-            fade_outset: Edges {
-                top: px(top.1),
-                right: px(right.1),
-                bottom: px(bottom.1),
-                left: px(left.1),
-            },
-        }
-    }
 }
+
+macro_rules! impl_content_mask_intersect {
+    ($unit:ident) => {
+        impl ContentMask<$unit> {
+            /// Intersect the content mask with the given content mask.
+            ///
+            /// Each mask's edge fades keep their position in window space, so content inside
+            /// an outer mask's fade band stays faded when a nested mask clips it. When both
+            /// masks fade the same edge, the result is transparent at the clip edge and opaque
+            /// only past both ramps; ramps that share a start keep the stronger fade.
+            pub fn intersect(&self, other: &Self) -> Self {
+                // Clip edges measured inward, in `Edges` order: top, right, bottom, left.
+                fn clip_edges(bounds: &Bounds<$unit>) -> [f32; 4] {
+                    [
+                        bounds.top().0,
+                        -bounds.right().0,
+                        -bounds.bottom().0,
+                        bounds.left().0,
+                    ]
+                }
+                fn edge_values(edges: &Edges<$unit>) -> [f32; 4] {
+                    [edges.top.0, edges.right.0, edges.bottom.0, edges.left.0]
+                }
+                fn ramps(mask: &ContentMask<$unit>) -> [Option<FadeRamp>; 4] {
+                    let clips = clip_edges(&mask.bounds);
+                    let fades = edge_values(&mask.fade_out);
+                    let outsets = edge_values(&mask.fade_outset);
+                    std::array::from_fn(|edge| {
+                        FadeRamp::new(clips[edge], fades[edge], outsets[edge])
+                    })
+                }
+
+                let bounds = self.bounds.intersect(&other.bounds);
+                let clips = clip_edges(&bounds);
+                let (self_ramps, other_ramps) = (ramps(self), ramps(other));
+                let [top, right, bottom, left] = std::array::from_fn(|edge| {
+                    let ramp =
+                        FadeRamp::intersect(self_ramps[edge], other_ramps[edge], clips[edge]);
+                    FadeRamp::distances(ramp, clips[edge])
+                });
+
+                ContentMask {
+                    bounds,
+                    fade_out: Edges {
+                        top: $unit(top.0),
+                        right: $unit(right.0),
+                        bottom: $unit(bottom.0),
+                        left: $unit(left.0),
+                    },
+                    fade_outset: Edges {
+                        top: $unit(top.1),
+                        right: $unit(right.1),
+                        bottom: $unit(bottom.1),
+                        left: $unit(left.1),
+                    },
+                }
+            }
+        }
+    };
+}
+
+impl_content_mask_intersect!(Pixels);
+impl_content_mask_intersect!(ScaledPixels);
 
 #[cfg(test)]
 mod content_mask_tests {
@@ -5004,13 +5016,14 @@ impl Window {
         ];
 
         for strip in strips {
-            let content_mask_bounds = quad.content_mask.bounds.intersect(&strip);
-            if !content_mask_bounds.is_empty() {
+            // Narrowing the mask to the strip keeps its edge fades in place.
+            let content_mask = quad.content_mask.intersect(&ContentMask {
+                bounds: strip,
+                ..Default::default()
+            });
+            if !content_mask.bounds.is_empty() {
                 self.next_frame.scene.insert_primitive(Quad {
-                    content_mask: ContentMask {
-                        bounds: content_mask_bounds,
-                        ..Default::default()
-                    },
+                    content_mask,
                     ..quad
                 });
             }
@@ -8867,6 +8880,92 @@ mod tests {
                         border.border_widths.left.0,
                     ],
                     [2.0, 4.0, 6.0, 8.0].map(|width| width * scale)
+                );
+            })
+            .unwrap();
+    }
+
+    fn left_and_top_fade_mask() -> ContentMask<Pixels> {
+        ContentMask {
+            bounds: Bounds::new(point(px(0.), px(0.)), size(px(200.), px(200.))),
+            fade_out: Edges {
+                top: px(20.),
+                left: px(20.),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    struct FadedOutlineView;
+
+    impl Render for FadedOutlineView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            canvas(
+                |_, _, _| {},
+                |_, _, window, _| {
+                    window.with_content_mask(Some(left_and_top_fade_mask()), |window| {
+                        window.paint_quad(
+                            PaintQuad::new(Bounds::new(
+                                point(px(10.), px(10.)),
+                                size(px(100.), px(100.)),
+                            ))
+                            .border_widths(2.)
+                            .border_color(crate::white()),
+                        );
+                    });
+                },
+            )
+            .size_full()
+        }
+    }
+
+    #[gpui::test]
+    fn border_only_quads_keep_their_edge_fades(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| FadedOutlineView);
+        window
+            .update(cx, |_, window, _| {
+                let scale = window.scale_factor();
+                let quads = &window.rendered_frame.scene.quads;
+                assert_eq!(quads.len(), 4, "the outline should be split into strips");
+
+                let expected_mask = left_and_top_fade_mask().scale(scale);
+                for quad in quads {
+                    let expected = expected_mask.intersect(&ContentMask {
+                        bounds: quad.content_mask.bounds,
+                        ..Default::default()
+                    });
+                    assert_eq!(quad.content_mask, expected);
+                }
+
+                // The strips along the faded edges keep the full 20px ramps, anchored at
+                // the window edge rather than at the strip.
+                let left_strip = quads
+                    .iter()
+                    .find(|quad| {
+                        quad.content_mask.bounds.left() == quad.bounds.left()
+                            && quad.content_mask.bounds.size.width < quad.bounds.size.width
+                    })
+                    .expect("left strip");
+                assert_eq!(
+                    left_strip.content_mask.fade_out.left,
+                    ScaledPixels(20. * scale)
+                );
+                assert_eq!(
+                    left_strip.content_mask.fade_outset.left,
+                    ScaledPixels(10. * scale)
+                );
+                let top_strip = quads
+                    .iter()
+                    .find(|quad| quad.content_mask.bounds.top() == quad.bounds.top())
+                    .expect("top strip");
+                assert_eq!(
+                    top_strip.content_mask.fade_out.top,
+                    ScaledPixels(20. * scale)
+                );
+                assert_eq!(
+                    top_strip.content_mask.fade_out.left,
+                    ScaledPixels(20. * scale)
                 );
             })
             .unwrap();
