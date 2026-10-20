@@ -585,6 +585,32 @@ impl ImageSource {
         }
     }
 
+    /// Remove this image source from the asset system and free the decoded
+    /// image's sprite atlas tiles in every window.
+    ///
+    /// [`Self::remove_asset`] alone leaves the tiles of `Resource` and `Image`
+    /// sources in the atlas: the decoded [`RenderImage`] lives inside the asset
+    /// cache, so callers can't reach [`App::drop_image`] themselves. Pass the
+    /// window currently being updated, if any, since it is absent from the
+    /// app's window list during its own update and would otherwise keep its
+    /// tiles.
+    pub fn evict(&self, window: Option<&mut Window>, cx: &mut App) {
+        let render_image = match self {
+            ImageSource::Resource(resource) => cx
+                .peek_asset::<ImgResourceLoader>(resource)
+                .and_then(Result::ok),
+            ImageSource::Image(data) => cx
+                .peek_asset::<AssetLogger<ImageDecoder>>(data)
+                .and_then(Result::ok),
+            ImageSource::Render(data) => Some(data.clone()),
+            ImageSource::Custom(_) => None,
+        };
+        self.remove_asset(cx);
+        if let Some(image) = render_image {
+            cx.drop_image(image, window);
+        }
+    }
+
     /// Check whether this image source is present in the asset system (loading
     /// or loaded), without fetching it.
     #[cfg(any(test, feature = "test-support"))]
@@ -831,6 +857,45 @@ mod tests {
                 });
             },
         )
+    }
+
+    #[gpui::test]
+    fn evict_frees_cached_image_from_the_atlas(cx: &mut TestAppContext) {
+        let mut png = Vec::new();
+        ImageBuffer::from_pixel(4, 4, Rgba([255u8, 0, 0, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let source = ImageSource::Image(Arc::new(crate::Image::from_bytes(
+            crate::ImageFormat::Png,
+            png,
+        )));
+        let ImageSource::Image(data) = &source else {
+            unreachable!()
+        };
+        let data = data.clone();
+
+        let window = cx.add_empty_window();
+        let _ = window.update(|_, cx| cx.fetch_asset::<AssetLogger<ImageDecoder>>(&data));
+        window.run_until_parked();
+        window.draw(point(px(0.), px(0.)), size(px(10.), px(10.)), |_, _| {
+            img(source.clone()).size(px(4.)).into_any_element()
+        });
+
+        let render_image = window
+            .update(|_, cx| cx.peek_asset::<AssetLogger<ImageDecoder>>(&data))
+            .expect("decoded image should be cached")
+            .expect("image should decode");
+        assert!(window.update(|window, _| window.has_image_atlas_entry(&render_image)));
+
+        window.update(|window, cx| source.evict(Some(window), cx));
+
+        assert!(!window.update(|window, _| window.has_image_atlas_entry(&render_image)));
+        assert!(!window.update(|_, cx| source.is_asset_cached(cx)));
+        assert!(
+            window
+                .update(|_, cx| cx.peek_asset::<AssetLogger<ImageDecoder>>(&data))
+                .is_none()
+        );
     }
 
     #[gpui::test]
