@@ -9224,6 +9224,34 @@ mod tests {
             .unwrap();
     }
 
+    struct RoundedOverflowView;
+
+    impl Render for RoundedOverflowView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size(px(80.))
+                .rounded(px(16.))
+                .overflow_hidden()
+                .child(div().size_full().bg(crate::blue()))
+        }
+    }
+
+    #[gpui::test]
+    fn hidden_overflow_clips_children_to_rounded_corners(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| RoundedOverflowView);
+        window
+            .update(cx, |_, window, _| {
+                let scale = window.scale_factor();
+                let quads = &window.rendered_frame.scene.quads;
+                assert_eq!(quads.len(), 1);
+                assert_eq!(
+                    quads[0].content_mask.corner_radii,
+                    Corners::all(ScaledPixels(16. * scale))
+                );
+            })
+            .unwrap();
+    }
+
     struct OpensWindowOnPaint {
         opened: Rc<Cell<bool>>,
     }
